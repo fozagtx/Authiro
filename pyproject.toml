@@ -33,9 +33,9 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "apache-burr[tracking]>=0.42,<0.43",
+    "apache-burr[tracking]>=0.42,<0.44",
     "cryptography>=42",
-    "fastmcp>=3.4,<4.0",
+    "fastmcp>=3.4,<5.0",
     "pydantic>=2,<3",
     "pyyaml>=6",
     "typer>=0.12,<1.0",
@@ -48,12 +48,12 @@ dependencies = [
 
 [project.optional-dependencies]
 observability = [
-    "apache-burr[opentelemetry]>=0.42,<0.43",
+    "apache-burr[opentelemetry]>=0.42,<0.44",
     "opentelemetry-api>=1.20",
     "opentelemetry-sdk>=1.20",
 ]
 ui = [
-    "apache-burr[start]>=0.42,<0.43",
+    "apache-burr[start]>=0.42,<0.44",
 ]
 mellea = [
     "mellea>=0.1",
