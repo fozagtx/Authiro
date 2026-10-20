@@ -1,0 +1,3082 @@
+"""Mount a Burr Application as a FastMCP server.
+
+One serving mode:
+
+  • ``ServingMode.STEP``:    One ``step(action_name, **inputs)``
+                             meta-tool. Server enforces valid
+                             transitions. The four-tool surface
+                             (step + reset_session + fork_at +
+                             fork_from_past) is constant across every
+                             FSM, regardless of action count, so the
+                             tool listing stays compact while the
+                             action namespace lives in step's argument
+                             schema and ``authiro://graph``.
+
+The mount registers eight resources:
+
+  • ``authiro://graph``:           static description of the FSM topology
+                                (actions, reads/writes/inputs, edges
+                                with conditions). Read once per session.
+  • ``authiro://graph/mermaid``:   the FSM as Mermaid stateDiagram source.
+  • ``authiro://graph/dot``:       the FSM as Graphviz DOT source.
+  • ``authiro://source/{action}``: an action's Python source.
+  • ``authiro://state``:           current Application state as JSON.
+  • ``authiro://next``:            actions reachable from current state.
+  • ``authiro://history``:         per-session timeline of every action
+                                attempt (successes + refusals).
+  • ``authiro://trace``:           Burr's on-disk LocalTrackingClient log.
+  • ``authiro://children``:        Burr-native sub-apps spawned/forked from
+                                this session (``children.jsonl``).
+  • ``authiro://upstreams``:       configured upstream MCP servers + health.
+  • ``authiro://session``:         tracker coordinates (project, app_id,
+                                app_dir, partition_key), run progress
+                                (sequence_id, current_action), and
+                                fork/spawn lineage (parent, spawning_parent).
+  • ``authiro://subruns``:         index of sub-Application runs spawned
+                                in this session via ``spawn_subapp``.
+  • ``authiro://subruns/{id}``:    full record for one sub-run.
+
+Per-session isolation:
+
+  Pass a callable factory ``() -> Application`` instead of an
+  ``Application`` instance. Each MCP session then gets its own
+  Application built lazily on first tool call and stored in FastMCP's
+  session state. Two clients connected to the same server see
+  independent state.
+
+  Passing an Application instance directly preserves the simpler
+  shared-state behavior, where all sessions mutate one FSM.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import contextvars
+import inspect
+import io
+import json
+import logging
+import os
+import re
+import time
+import typing
+import uuid
+from collections.abc import Callable
+from datetime import UTC, datetime
+from enum import Enum
+from pathlib import Path
+from typing import TYPE_CHECKING, Annotated, Any
+
+if TYPE_CHECKING:
+    from authiro.persona import PersonaSource
+
+import pydantic
+from burr.core import Application, ApplicationBuilder
+from burr.core.action import Action
+from fastmcp import Context, FastMCP
+from fastmcp.tools.base import ToolResult
+
+from authiro.upstream import UpstreamManager, bind_upstream, reset_upstream
+
+# Internal, session-aware factory: ``(session_id) -> Application``. The adapter
+# threads this everywhere a session's Application is (re)built. See _resolve for
+# how a user-supplied factory is normalized into one.
+ApplicationFactory = Callable[[str], Application[Any]]
+# What a caller passes to ``mount``: a built Application (shared across
+# sessions), or a zero-arg callable returning either an Application or an
+# unbuilt ApplicationBuilder. Returning a builder lets Authiro stamp
+# ``app_id = session_id`` before build, binding Burr's tracking identity to the
+# session key.
+UserFactory = Callable[[], "Application[Any] | ApplicationBuilder[Any]"]
+ApplicationOrFactory = Application[Any] | UserFactory
+
+logger = logging.getLogger("authiro")
+
+# Defaults for session-store eviction.
+_DEFAULT_SESSION_TTL_SECONDS = 3600  # 1 hour idle
+_DEFAULT_MAX_SESSIONS = 100
+
+#: Set once the shared-app isolation warning has fired, so a process that
+#: mounts many instance-mode servers gets the message once, not per mount.
+_shared_app_warned = False
+
+
+def _warn_shared_app_mode() -> None:
+    """Warn that an instance-mounted server shares one FSM across all sessions.
+
+    Mounting a built ``Application`` (rather than a ``() -> Application``
+    factory) is the documented shared-state mode and is fine for a single
+    stdio client. But on a multi-client transport (HTTP/SSE) every connected
+    client mutates the same Application: no per-session isolation, and the
+    fork/reset tools refuse. The warning steers users to factory mode before
+    they discover this the hard way.
+    """
+    global _shared_app_warned
+    if _shared_app_warned:
+        return
+    _shared_app_warned = True
+    logger.warning(
+        "authiro: mounted a built Application (shared-app mode). All MCP "
+        "sessions share one FSM and its state; fork_at/fork_from_past/"
+        "reset_session are disabled. Fine for a single stdio client, but on "
+        "an HTTP/SSE transport connected clients are NOT isolated. Pass a "
+        "factory `() -> Application` to mount() for per-session isolation."
+    )
+
+
+class ServingMode(str, Enum):  # noqa: UP042  # (str, Enum) for stable wire serialization
+    """How a mounted Application is exposed; ``STEP`` is the only mode."""
+
+    STEP = "step"
+    # ``TOOLS`` (one MCP tool per @action, no enforcement) and ``DYNAMIC``
+    # (per-session ``tools/list_changed`` visibility) were carved out into
+    # ``authiro._experimental.modes`` after STEP became the sole product.
+    # The enum is preserved (single-member) so callers that pass
+    # ``mode=ServingMode.STEP`` keep working.
+
+
+# Step tool response schema (Pydantic models + JSON Schema): see
+# ``authiro._step_schema``. Re-exported here for backward compat with
+# any code that grabs the underscored shapes off this module.
+from authiro._diagram import (  # noqa: E402
+    _render_dot,
+    _render_mermaid,
+    _topology_from_app,
+)
+from authiro._introspect import (  # noqa: E402,F401 (re-export)
+    _INTERNAL_STATE_KEYS,
+    _PER_ACTION_TIMEOUT_ATTR,
+    _action_timeout,
+    _public_state,
+    _serializable_state,
+)
+from authiro._step_schema import (  # noqa: E402
+    _step_response_schema,
+)
+
+# State keys Burr writes itself. Hide them from the public state view so
+# the MCP client sees only the user's domain fields.
+# Tracker disk-location helpers: see ``authiro._tracker``. Re-exported
+# so anything reaching for ``_tracker_project``, ``_tracker_log_path``, or
+# ``_read_trace`` off this module keeps working.
+from authiro._tracker import (  # noqa: E402,F401
+    _TRACE_MAX_ENTRIES,
+    _children_path,
+    _read_trace,
+    _tracker_log_path,
+    _tracker_project,
+)
+
+
+def _restore_snapshot(
+    *,
+    entry: Any,
+    factory: ApplicationFactory,
+    session_id: str,
+    state_dict: dict[str, Any],
+    last_action: str | None,
+    sequence_id_override: int | None = None,
+    kept_subruns: dict[str, Any] | None = None,
+) -> tuple[Application[Any], dict[str, Any], list[str]]:
+    """Shared body for ``fork_at`` and ``fork_from_past``.
+
+    Rebuilds the session's Application via the factory, overwrites its
+    state with ``state_dict`` plus ``__PRIOR_STEP`` (and optionally
+    ``__SEQUENCE_ID`` for in-session forks where the tracker count must
+    stay monotonic), and applies the caller's sub-runs policy. Returns
+    ``(new_app, serialized_state, valid_next_actions)`` for the caller
+    to build its response payload around.
+
+    ``kept_subruns`` semantics:
+      * ``None`` (default): clear all (``fork_from_past`` behavior).
+      * dict: replace the session's subruns with this filtered subset
+        (``fork_at`` keeps sub-runs spawned before the fork point).
+    """
+    from burr.core.state import State as _BurrState
+
+    entry.application = factory(session_id)
+    new_app = entry.application
+    assert new_app is not None
+
+    forked_state_dict: dict[str, Any] = state_dict | {"__PRIOR_STEP": last_action}
+    if sequence_id_override is not None:
+        forked_state_dict["__SEQUENCE_ID"] = sequence_id_override
+    new_app.update_state(_BurrState(forked_state_dict))
+
+    entry.subruns = kept_subruns if kept_subruns is not None else {}
+
+    new_state, coerced = _serializable_state(_public_state(new_app.state.get_all()))
+    if coerced:
+        new_state["_authiro"] = {"coerced_keys": coerced}
+    valid_next = valid_next_action_names(new_app)
+    entry.last_access = time.monotonic()
+
+    return new_app, new_state, valid_next
+
+
+# The machinery preamble shipped to every Authiro-served MCP server by
+# default. It teaches the agent how to drive the workflow: one step tool,
+# pick from the listed actions, recover from refusals by reading
+# valid_next_actions, stop at terminal. Validated in the floor test (qwen3:0.6b
+# went from 0/10 to 10/10 on a trivial 3-action FSM once this was present).
+# Mount() prepends this to any developer-supplied ``instructions`` unless
+# ``include_default_instructions=False`` is passed.
+DEFAULT_INSTRUCTIONS = """\
+This server exposes several tools. To drive the workflow, use only the `step` \
+tool. Follow this loop:
+
+1. Call `step` with {"action": "<NAME>", "inputs": {}} where <NAME> is one of \
+the action names listed in the `step` tool's schema.
+
+2. If the response contains "valid_next_actions": [...], your call was \
+refused. You MUST call `step` again with one of the names in that list. Do \
+not write a text reply.
+
+3. If the response contains "known_actions" but the action you used is not in \
+the list, you used a name that does not exist. Pick a name from \
+"known_actions" or "valid_next_actions" and call `step` again.
+
+4. Stop when the response shows a terminal state (no "valid_next_actions" \
+listed)."""
+
+
+# Graph summary + action surface: see ``authiro._graph_summary``.
+# Re-exported so anything reaching for these off this module keeps working.
+from authiro._graph_summary import (  # noqa: E402
+    _compute_graph_summary,
+    _graph_actions_by_tag,
+    _next_external_tools,
+    _normalize_external_tools,
+    _render_action_surface,
+)
+
+
+def _build_persona_frame(
+    ctx: Context | None,
+    store: _SessionStore,
+    factory: ApplicationFactory | None,
+) -> dict[str, Any] | None:
+    """Build the frame dict for persona interpolation, or ``None`` if no session.
+
+    Top-level keys: ``state.<field>``, ``action.name``, ``action.reachable``,
+    ``graph.total_actions``, ``graph.all_actions``, ``session.session_id``.
+    """
+    if ctx is None or factory is None:
+        return None
+    try:
+        session_id = _session_key(ctx)
+    except Exception:
+        return None
+    entry = store.get_or_create(session_id, factory)
+    app = entry.application
+    if app is None:
+        return None
+    state_fields = dict(app.state.get_all())
+    state_fields.pop("__PRIOR_STEP", None)
+    last_action = app.state.get("__PRIOR_STEP") or app.entrypoint
+    reachable = valid_next_action_names(app)
+    return {
+        "state": state_fields,
+        "action": {
+            "name": last_action,
+            "reachable": ", ".join(reachable),
+        },
+        "graph": {
+            "total_actions": len(app.graph.actions),
+            "all_actions": ", ".join(a.name for a in app.graph.actions),
+        },
+        "session": {"session_id": session_id},
+    }
+
+
+from authiro._exceptions import (  # noqa: E402 (re-export)
+    ActionExecutionError,
+    ActionTimeoutError,
+    InvalidTransitionError,
+    ValidationFailed,
+)
+from authiro._introspect import (  # noqa: E402,F401 (re-export)
+    _action_inputs,
+    _action_signature_params,
+    _annotation_to_schema,
+    _coerce_pydantic_inputs,
+    _input_schemas,
+    _next_action_schemas,
+    _pydantic_model_in_annotation,
+    valid_next_action_names,
+)
+
+#: ContextVar set by the step handler around each ``_step_application``
+#: call. Reads inside an action body see their session's entry; used by
+#: ``spawn_subapp`` to record sub-run timelines on the parent session.
+_current_subrun_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "_authiro_current_subrun_id", default=None
+)
+_current_session_entry: contextvars.ContextVar[_SessionEntry | None] = contextvars.ContextVar(
+    "_authiro_current_session", default=None
+)
+
+#: ContextVar set by the step handler around each ``_step_application``
+#: call. Holds the FastMCP ``Context`` injected by the MCP transport so
+#: action bodies can call ``ctx.sample(...)``, ``ctx.elicit(...)``,
+#: ``ctx.report_progress(...)``, ``ctx.read_resource(...)``, etc.
+#: Reads via the public ``current_mcp_context()`` helper return the
+#: current value (or ``None`` outside an action body).
+_current_fastmcp_context: contextvars.ContextVar[Context | None] = contextvars.ContextVar(
+    "_authiro_current_fastmcp_context", default=None
+)
+
+
+#: Explicit session handle supplied by the client as a tool argument. The
+#: MCP 2026-07-28 revision removed protocol-level sessions, so on modern
+#: connections ``ctx.session_id`` is a fresh UUID per request; the sanctioned
+#: replacement (SEP-2567) is a server-minted handle passed back as an
+#: ordinary tool argument. ``step``'s ``app_id`` is that handle.
+_session_handle: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "_authiro_session_handle", default=None
+)
+
+
+def _session_key(ctx: Context) -> str:
+    """Resolve the session key: explicit client handle, else transport id.
+
+    On pre-2026 protocol connections ``ctx.session_id`` is stable per client
+    and nothing changes. On sessionless connections it churns per request, so
+    continuity requires the client to echo the handle.
+    """
+    handle = _session_handle.get()
+    if handle is not None:
+        return handle
+    return ctx.session_id
+
+
+def current_mcp_context() -> Context | None:
+    """Return the FastMCP ``Context`` for the currently-dispatching tool call.
+
+    Returns ``None`` outside an action body. Inside an action driven via
+    authiro's adapter, returns the Context FastMCP injected into the
+    step handler, so action bodies can call ``ctx.sample(...)``,
+    ``ctx.elicit(...)``, ``ctx.report_progress(...)``,
+    ``ctx.read_resource(...)``, etc.
+
+    Use this to delegate LLM work to the connected agent's model, ask
+    the user for interactive confirmation, or read another resource the
+    server exposes from inside an action body.
+    """
+    return _current_fastmcp_context.get()
+
+
+async def spawn_subapp(
+    sub_application: Application[Any],
+    *,
+    label: str | None = None,
+    halt_after: list[str] | None = None,
+    inputs: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Run a sub-Application inside an action and record its timeline.
+
+    The sub-run is appended to the parent session's subruns dict and
+    surfaced via ``authiro://subruns`` and ``authiro://subruns/{subrun_id}``.
+
+    Args:
+        sub_application: Built ``burr.core.Application`` to run. Each
+            call gets a fresh subrun_id.
+        label: Friendly name attached to the subrun record.
+        halt_after: Forwarded to ``app.arun(halt_after=...)``. Defaults
+            to the sub-graph's last action.
+        inputs: Forwarded to ``app.arun(inputs=...)``.
+
+    Returns:
+        ``{"subrun_id": str, "final_state": dict, "label": str | None}``.
+
+    Outside an active session the sub-run still executes but isn't
+    recorded; the function returns the final state regardless.
+    """
+    entry = _current_session_entry.get()
+    sub_id = f"sub-{uuid.uuid4()}"
+    started = datetime.now(UTC).isoformat()
+    record: dict[str, Any] = {
+        "id": sub_id,
+        "label": label,
+        "started_ts": started,
+        "ended_ts": None,
+        "parent_subrun_id": _current_subrun_id.get(),
+        "history": [],
+        "final_state": None,
+        "error": None,
+    }
+    if entry is not None:
+        entry.subruns[sub_id] = record
+        entry.last_access = time.monotonic()
+
+    halt_after_names = set(
+        halt_after if halt_after is not None else [sub_application.graph.actions[-1].name]
+    )
+    subrun_token = _current_subrun_id.set(sub_id)
+    try:
+        # Drive the sub-app step-by-step so ``record["history"]`` populates
+        # without requiring the sub-Application to wire its own tracker.
+        # Each step lands in the record as it completes; halt_after is
+        # checked after the action runs (Burr's arun semantics).
+        step_inputs: dict[str, Any] = dict(inputs or {})
+        final_state = sub_application.state
+        seq = 0
+        while True:
+            stepped = await sub_application.astep(inputs=step_inputs)
+            if stepped is None:
+                break
+            action_obj, _result, new_state = stepped
+            step_state = _serializable_state(_public_state(new_state.get_all()))[0]
+            record["history"].append({"seq": seq, "action": action_obj.name, "state": step_state})
+            seq += 1
+            final_state = new_state
+            step_inputs = {}  # only the first astep carries client inputs
+            if action_obj.name in halt_after_names:
+                break
+        final = _serializable_state(_public_state(final_state.get_all()))[0]
+        record["final_state"] = final
+        record["ended_ts"] = datetime.now(UTC).isoformat()
+        return {"subrun_id": sub_id, "label": label, "final_state": final}
+    except Exception as exc:
+        record["error"] = {"type": type(exc).__name__, "message": str(exc)}
+        record["ended_ts"] = datetime.now(UTC).isoformat()
+        raise
+    finally:
+        _current_subrun_id.reset(subrun_token)
+
+
+# Function attribute that lets hand-written Burr actions declare a
+# validator without going through the importer's ``ToolSpec``. ``mount``
+# reads ``_authiro_validator`` off each action's ``fn`` like the
+# timeout attribute, so the same escape hatch works for both.
+_PER_ACTION_VALIDATOR_ATTR = "_authiro_validator"
+
+
+def _action_validator(
+    action: Action,
+    mount_overrides: dict[str, Callable[..., Any]] | None,
+) -> Callable[..., Any] | None:
+    """Return the input validator for ``action``, or None.
+
+    A ``mount(input_validators={...})`` mapping wins over a
+    function-attribute. Either source produces the same effect.
+    """
+    if mount_overrides is not None:
+        v = mount_overrides.get(action.name)
+        if v is not None:
+            return v
+    fn = getattr(action, "fn", None)
+    if fn is None:
+        return None
+    return getattr(fn, _PER_ACTION_VALIDATOR_ATTR, None)
+
+
+async def _run_validator(
+    validator: Callable[..., Any],
+    state_dict: dict[str, Any],
+    inputs: dict[str, Any],
+) -> dict[str, Any]:
+    """Invoke a validator (sync or async); return normalised inputs.
+
+    The validator may raise ``ValidationFailed`` to refuse, return a
+    dict to substitute, or return None to accept the originals. Other
+    exceptions propagate to the caller which wraps them as
+    ``ActionExecutionError``.
+    """
+    if asyncio.iscoroutinefunction(validator):
+        result = await validator(state_dict, inputs)
+    else:
+        result = validator(state_dict, inputs)
+    if result is None:
+        return inputs
+    if not isinstance(result, dict):
+        raise ValidationFailed(
+            "validator returned a non-dict result",
+            details={"returned_type": type(result).__name__},
+        )
+    return result
+
+
+def _build_session_app(
+    produced: Application[Any] | ApplicationBuilder[Any],
+    session_id: str,
+    *,
+    suppress_tracker: bool = False,
+    session_app_id: Callable[[str], str] | None = None,
+) -> Application[Any]:
+    """Realize one session's Application from a factory's return value.
+
+    A built ``Application`` is used as-is (legacy path; identity is whatever
+    the builder froze, so it is not bound to the session). An
+    ``ApplicationBuilder`` is stamped with ``app_id = session_id`` and built,
+    so Burr's tracking dir (``storage_dir/project/<session_id>/``) matches the
+    Authiro session key and never drifts on reset.
+
+    ``session_app_id`` (a ``mount`` hook) maps the session id to a custom Burr
+    ``app_id`` for builder factories, e.g. a timestamped, name-sortable id like
+    ``20260627T171435-841aac`` instead of the bare ``session_id``. Default
+    keeps ``app_id = session_id``.
+
+    ``suppress_tracker`` nulls the builder's tracker before building, used for
+    the mount-time introspection template so it doesn't write a phantom
+    ``authiro-template`` session dir into the user's tracker storage (it
+    would otherwise show up in ``sessions ls``). Real sessions rebuild from a
+    fresh factory call with the tracker intact.
+    """
+    if isinstance(produced, ApplicationBuilder):
+        if suppress_tracker and produced.tracker is not None:
+            # with_tracker registers the tracker in both .tracker and
+            # .lifecycle_adapters (Burr ApplicationBuilder slots; see pyproject
+            # pin); drop it from both by identity so the template build fires no
+            # post_application_create, while preserving any user hooks.
+            produced.lifecycle_adapters = [
+                a for a in produced.lifecycle_adapters if a is not produced.tracker
+            ]
+            produced.tracker = None
+        app_id = session_app_id(session_id) if session_app_id is not None else session_id
+        return produced.with_identifiers(app_id=app_id).build()
+    if isinstance(produced, Application):
+        return produced
+    raise TypeError(
+        f"factory returned {type(produced).__name__}, expected a "
+        f"burr.core.Application or burr.core.ApplicationBuilder"
+    )
+
+
+def _builder_has_local_tracker(builder: ApplicationBuilder[Any]) -> bool:
+    """Whether a builder's tracker is a ``LocalTrackingClient``.
+
+    The builder analogue of ``_has_local_tracker``: needed because the
+    introspection template is built with its tracker suppressed, so the
+    template can't be asked whether real sessions are tracked.
+    """
+    try:
+        from burr.tracking.client import LocalTrackingClient
+    except ImportError:
+        return False
+    return isinstance(getattr(builder, "tracker", None), LocalTrackingClient)
+
+
+def _resolve(
+    application: ApplicationOrFactory,
+    session_app_id: Callable[[str], str] | None = None,
+) -> tuple[Application[Any], ApplicationFactory | None, bool]:
+    """Split ``application`` into ``(template, factory, sessions_tracked)``.
+
+    The template is what mount-time introspection reads to register tools
+    and resources. The factory, if present, is the session-aware
+    ``(session_id) -> Application`` each session calls for its own isolated,
+    identity-bound Application. ``sessions_tracked`` reports whether real
+    sessions carry a ``LocalTrackingClient`` — captured before the template's
+    tracker is suppressed, since fork tooling gates on it.
+
+    Passing an ``Application`` instance returns ``(instance, None, ...)``.
+    Passing a callable returns ``(template, session_factory, ...)``: the
+    template is built once with a throwaway id (tracker suppressed so it writes
+    no phantom session dir); ``session_factory`` invokes the user callable
+    afresh per session and binds the id.
+    """
+    if isinstance(application, Application):
+        return application, None, _has_local_tracker(application)
+    if callable(application):
+        user_factory = application
+
+        def session_factory(session_id: str) -> Application[Any]:
+            return _build_session_app(user_factory(), session_id, session_app_id=session_app_id)
+
+        produced = user_factory()
+        if isinstance(produced, ApplicationBuilder):
+            tracked = _builder_has_local_tracker(produced)
+        else:
+            tracked = _has_local_tracker(produced)
+        template = _build_session_app(produced, "authiro-template", suppress_tracker=True)
+        return template, session_factory, tracked
+    raise TypeError(
+        f"mount() expects a burr.core.Application or a callable returning one, "
+        f"got {type(application).__name__}"
+    )
+
+
+from authiro._session import (  # noqa: E402 (re-export for adapter backcompat)
+    _DEFAULT_MAX_SESSIONS,
+    _DEFAULT_SESSION_TTL_SECONDS,
+    _SessionEntry,
+    _SessionStore,
+)
+
+
+def _record_history(
+    store: _SessionStore,
+    ctx: Context | None,
+    factory: ApplicationFactory | None,
+    *,
+    action: str,
+    inputs: dict[str, Any],
+    state_after: dict[str, Any] | None,
+    valid_next_actions: list[str],
+    refused: bool = False,
+    refusal_reason: str | None = None,
+    error_message: str | None = None,
+    error_type: str | None = None,
+    subruns: list[str] | None = None,
+    app: Application[Any] | None = None,
+) -> None:
+    """Append one timeline entry to this session's history.
+
+    Records successes and refusals alike. When ``refusal_reason`` is
+    ``"action_error"``, the entry also carries ``error_message`` and
+    ``error_type`` so a client can distinguish "the FSM said no" from
+    "the action's code raised." When the action spawned sub-runs via
+    ``spawn_subapp``, their ids are listed under ``subruns`` so the
+    client can correlate the parent entry with the child timelines at
+    ``authiro://subruns/{id}``. No-op when ``ctx`` is None.
+    """
+    if ctx is None:
+        return
+    entry = store.get_or_create(_session_key(ctx), factory)
+    record: dict[str, Any] = {
+        "seq": len(entry.history),
+        "ts": datetime.now(UTC).isoformat(),
+        "action": action,
+        "inputs": inputs,
+        "state_after": state_after,
+        "valid_next_actions": valid_next_actions,
+        "refused": refused,
+        "refusal_reason": refusal_reason,
+    }
+    if error_message is not None:
+        record["error_message"] = error_message
+    if error_type is not None:
+        record["error_type"] = error_type
+    if subruns:
+        record["subruns"] = subruns
+        record["subrun_uris"] = [f"authiro://subruns/{sid}" for sid in subruns]
+    entry.history.append(record)
+    entry.last_access = time.monotonic()
+    # In factory mode the session app is entry.application; in shared-app mode it
+    # lives outside the entry, so the caller passes it. Either way the durable
+    # artifacts need the app that actually owns the tracker.
+    durable_app = app if app is not None else entry.application
+    if durable_app is not None:
+        if refused:
+            _append_refusal_sidecar(durable_app, record)
+        _append_ledger(durable_app, record)
+
+
+# Ledger + refusal sidecar: see ``authiro._ledger``. Re-exported so
+# anything reaching for the audit-trail helpers off this module keeps
+# working.
+from authiro._ledger import (  # noqa: E402,F401
+    _append_ledger,
+    _append_refusal_sidecar,
+    _ledger_binding,
+)
+
+
+def _refusal_payload(
+    *,
+    exc: Exception,
+    action_name: str,
+    app: Application[Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Convert a step-side exception into an MCP refusal payload + history kwargs.
+
+    Single source of truth for the four-way error-to-refusal translation.
+    Returns ``(response_dict, history_kwargs)``: the caller hands the
+    first back to the MCP client and splats the second into
+    ``_record_history(... state_after=None, **history_kwargs)``.
+
+    ``valid_next_action_names(app)`` is computed once and shared between
+    the response and the history entry.
+    """
+    if isinstance(exc, InvalidTransitionError):
+        return (
+            {
+                "error": "invalid_transition",
+                "requested": exc.requested,
+                "valid_next_actions": exc.valid,
+                "next_action_schemas": _next_action_schemas(app, exc.valid),
+                "message": str(exc),
+            },
+            {
+                "refused": True,
+                "refusal_reason": "invalid_transition",
+                "valid_next_actions": exc.valid,
+            },
+        )
+    valid = valid_next_action_names(app)
+    schemas = _next_action_schemas(app, valid)
+    if isinstance(exc, ValidationFailed):
+        return (
+            {
+                "error": "validation_failed",
+                "requested": action_name,
+                "reason": exc.reason,
+                "details": exc.details,
+                "valid_next_actions": valid,
+                "next_action_schemas": schemas,
+            },
+            {
+                "refused": True,
+                "refusal_reason": "validation_failed",
+                "valid_next_actions": valid,
+                "error_message": exc.reason,
+                "error_type": "ValidationFailed",
+            },
+        )
+    if isinstance(exc, ActionTimeoutError):
+        return (
+            {
+                "error": "action_timeout",
+                "requested": action_name,
+                "timeout_seconds": exc.timeout_seconds,
+                "message": str(exc),
+                "valid_next_actions": valid,
+                "next_action_schemas": schemas,
+            },
+            {
+                "refused": True,
+                "refusal_reason": "action_timeout",
+                "valid_next_actions": valid,
+                "error_message": str(exc),
+                "error_type": "TimeoutError",
+            },
+        )
+    if isinstance(exc, ActionExecutionError):
+        return (
+            {
+                "error": "action_error",
+                "requested": action_name,
+                "error_type": type(exc.original).__name__,
+                "error_message": str(exc.original),
+                "valid_next_actions": valid,
+                "next_action_schemas": schemas,
+            },
+            {
+                "refused": True,
+                "refusal_reason": "action_error",
+                "valid_next_actions": valid,
+                "error_message": str(exc.original),
+                "error_type": type(exc.original).__name__,
+            },
+        )
+    raise exc  # not one of ours; let it propagate
+
+
+# Reactive next_hint layer: see ``authiro._hinting``. Re-exported here
+# so anything that grabs ``_auto_hint_success`` / ``_auto_hint_refusal`` /
+# ``_compose_next_hint`` / ``_truncate_words`` off this module keeps working.
+# Coercion middleware: see ``authiro._coercion``. Re-exported here for
+# code that imports ``_build_coercion_middleware`` or
+# ``_expects_object_or_array`` off this module.
+from authiro._coercion import (  # noqa: E402,F401
+    _build_coercion_middleware,
+    _expects_object_or_array,
+)
+from authiro._hinting import (  # noqa: E402,F401
+    _auto_hint_refusal,
+    _auto_hint_success,
+    _compose_next_hint,
+    _truncate_words,
+)
+
+
+def _session_app_and_lock(
+    ctx: Context | None,
+    shared_app: Application[Any],
+    shared_lock: asyncio.Lock,
+    factory: ApplicationFactory | None,
+    store: _SessionStore,
+) -> tuple[Application[Any], asyncio.Lock, _SessionEntry | None]:
+    """Resolve the ``(Application, lock, session_entry)`` for this request.
+
+    Shared-app mode (factory is None): returns ``shared_app`` plus the
+    server-wide ``shared_lock``. All sessions serialise their step
+    calls on this lock, because they're all mutating one Application.
+    The session entry is the per-session bookkeeping slot (history,
+    sub-runs); it still exists in shared-app mode for history's sake.
+
+    Factory mode: returns the session's own Application and the
+    session entry's own lock. Different sessions' steps run in
+    parallel; calls within one session queue on its lock.
+
+    ``ctx`` may be None when invoked outside an MCP request; in that
+    case ``entry`` is None and the app/lock come from the server-wide
+    defaults.
+    """
+    if ctx is None:
+        return shared_app, shared_lock, None
+    entry = store.get_or_create(_session_key(ctx), factory)
+    if factory is None:
+        return shared_app, shared_lock, entry
+    assert entry.application is not None  # factory mode guarantees this
+    return entry.application, entry.lock, entry
+
+
+async def _race_with_timeout(coro: typing.Awaitable[Any], timeout_seconds: float) -> Any:
+    """Run ``coro`` with a hard wall-clock budget.
+
+    Unlike :func:`asyncio.wait_for`, which waits for the cancelled task to
+    propagate ``CancelledError`` before returning, this returns at the
+    budget boundary regardless. The orphaned task continues in the
+    background until its own internals unwind (FastMCP's ``ctx.sample`` /
+    ``ctx.elicit`` notably do not honor cancellation cleanly because they
+    are waiting on a server-to-client request; ``wait_for`` would sit until
+    the FastMCP request timeout, defeating the action-level budget).
+
+    Raises :class:`TimeoutError` at the budget; the caller translates it
+    into an :class:`ActionTimeoutError` refusal.
+    """
+    task = asyncio.ensure_future(coro)
+    try:
+        done, _pending = await asyncio.wait({task}, timeout=timeout_seconds)
+        if task in done:
+            return task.result()
+        task.cancel()
+        raise TimeoutError(f"action did not complete within {timeout_seconds}s")
+    except BaseException:
+        if not task.done():
+            task.cancel()
+        raise
+
+
+async def _execute_astep(
+    app: Application[Any],
+    *,
+    inputs: dict[str, Any],
+    timeout_seconds: float | None,
+    target_action: Any,
+) -> tuple[Any, Any, Any]:
+    """Dispatch one ``astep`` call with timeout and stderr handling.
+
+    Suppress Burr's own stderr traceback display: the action error
+    surfaces as a structured ``action_error`` refusal on the wire, and
+    the traceback would print before that wire response and add noise to
+    the developer's terminal. Set AUTHIRO_VERBOSE=1 to keep it.
+
+    A sync action body would block the event loop, which defeats
+    ``asyncio.wait_for``: the cancellation timer cannot tick while the
+    body is running. Detect sync bodies and run the step in a thread so
+    blocking happens off the main loop and the timeout can fire. The
+    orphaned thread finishes in the background (Python cannot safely
+    kill threads), but the client gets a clean ``ActionTimeoutError``
+    refusal. Async bodies stay on the main loop where ctx-injection
+    works.
+
+    Sync bodies are driven through ``app.step`` rather than ``app.astep``.
+    Burr's ``_astep`` delegates a sync action to ``_step`` with hooks
+    disabled, then fires ``post_run_step`` from its own ``finally`` with a
+    stale local ``new_state`` (the pre-step state), so the tracker records
+    the wrong state for every sync action and the last step's committed
+    state is never persisted. ``step`` runs the identical ``_step``
+    machinery but logs the correct post-step state. Async bodies are
+    unaffected and stay on ``astep``.
+    """
+    if os.environ.get("AUTHIRO_VERBOSE"):
+        stderr_ctx: contextlib.AbstractContextManager[Any] = contextlib.nullcontext()
+    else:
+        stderr_ctx = contextlib.redirect_stderr(io.StringIO())
+    fn = getattr(target_action, "fn", None)
+    is_sync_body = fn is not None and not inspect.iscoroutinefunction(fn)
+    with stderr_ctx:
+        if is_sync_body:
+            # step is typed Optional; None only occurs before the first step.
+            if timeout_seconds is not None:
+                return await _race_with_timeout(  # type: ignore[no-any-return]
+                    asyncio.to_thread(lambda: app.step(inputs=inputs)), timeout_seconds
+                )
+            return app.step(inputs=inputs)  # type: ignore[return-value]
+        if timeout_seconds is not None:
+            return await _race_with_timeout(  # type: ignore[no-any-return]
+                app.astep(inputs=inputs), timeout_seconds
+            )
+        # astep is typed Optional; None only occurs before the first step.
+        return await app.astep(inputs=inputs)  # type: ignore[return-value]
+
+
+async def _step_application(
+    app: Application[Any],
+    action_name: str,
+    inputs: dict[str, Any],
+    timeout_seconds: float | None = None,
+    validator: Callable[..., Any] | None = None,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    """Run one step of the Application.
+
+    Refuses to step unless ``action_name`` is in the current valid-next
+    set; otherwise raises ``InvalidTransitionError``. ``timeout_seconds``
+    wraps the call in ``asyncio.wait_for``. ``validator`` runs after the
+    transition check and may raise ``ValidationFailed``, return None to
+    accept the originals, or return a dict to substitute normalised
+    inputs. Action-body exceptions are wrapped as ``ActionExecutionError``
+    so callers can record them structurally.
+    """
+    valid = valid_next_action_names(app)
+    if action_name not in valid:
+        raise InvalidTransitionError(action_name, valid)
+
+    if validator is not None:
+        inputs = await _run_validator(validator, _public_state(app.state.get_all()), inputs)
+
+    # Force Burr to run the specifically-requested action. ``astep``
+    # picks via ``self.get_next_action()``, which returns the first
+    # transition whose condition is true. In a branching graph that
+    # isn't necessarily the action the client named, so we override
+    # ``get_next_action`` for one call. Tracker hooks, state updates,
+    # and ``__PRIOR_STEP`` housekeeping all flow through Burr's normal
+    # ``_astep`` machinery; only the action selection is forced.
+    target_action = app.graph.get_action(action_name)
+    if target_action is None:
+        raise InvalidTransitionError(action_name, valid)
+
+    # Coerce dict-valued inputs into their declared Pydantic model types so
+    # the action body receives the typed object it annotated. Without this
+    # the action signature says ``order: OrderInput`` but the body sees a
+    # plain dict.
+    inputs = _coerce_pydantic_inputs(target_action, inputs)
+    is_streaming = bool(getattr(target_action, "streaming", False))
+    original_get_next_action = app.get_next_action
+    app.get_next_action = lambda: target_action  # type: ignore[method-assign]
+    try:
+        if is_streaming:
+            return await _step_streaming_action(
+                app=app,
+                action_name=action_name,
+                inputs=inputs,
+                ctx=ctx,
+                timeout_seconds=timeout_seconds,
+            )
+        # astep is typed Optional, but the monkey-patched get_next_action
+        # guarantees a non-None return for the client-named action.
+        a, result, new_state = await _execute_astep(
+            app,
+            inputs=inputs,
+            timeout_seconds=timeout_seconds,
+            target_action=target_action,
+        )
+    except (InvalidTransitionError, ActionExecutionError, ActionTimeoutError):
+        raise
+    except TimeoutError as exc:
+        raise ActionTimeoutError(action_name, timeout_seconds or 0.0) from exc
+    except Exception as exc:
+        # Anything raised by the wrapped action's fn comes out here.
+        # Wrap so the handler can record a structured refusal entry.
+        raise ActionExecutionError(action_name, exc) from exc
+    finally:
+        app.get_next_action = original_get_next_action  # type: ignore[method-assign]
+    state, coerced = _serializable_state(_public_state(new_state.get_all()))
+    if coerced:
+        state["_authiro"] = {"coerced_keys": coerced}
+    return {
+        "action": a.name,
+        "result": result,
+        "state": state,
+        "valid_next_actions": valid_next_action_names(app),
+        "app_id": app.uid,
+        "session": _session_key(ctx) if ctx is not None else None,
+        "tracker_project": _tracker_project(app),
+    }
+
+
+async def _step_streaming_action(
+    *,
+    app: Application[Any],
+    action_name: str,
+    inputs: dict[str, Any],
+    ctx: Context | None,
+    timeout_seconds: float | None,
+) -> dict[str, Any]:
+    """Run a streaming Burr action, surfacing chunks as MCP progress.
+
+    Burr streaming actions yield intermediate chunks plus a final
+    state. We forward each chunk to the client via
+    ``ctx.report_progress`` (the MCP-spec mechanism for partial
+    results during a long-running tool call), then return the final
+    state in the same shape as a regular step response. When ``ctx``
+    is None the chunks are still iterated but not surfaced; the final
+    state is returned regardless.
+
+    Cancellation on timeout is best-effort. The streaming container's
+    iterator is wrapped in ``asyncio.wait_for`` per-chunk so individual
+    chunks can time out, with the total budget shared across them.
+    """
+    try:
+        a, container = await app.astream_result(halt_after=[action_name], inputs=inputs)
+    except Exception as exc:
+        raise ActionExecutionError(action_name, exc) from exc
+
+    chunk_count = 0
+    try:
+        async for chunk in container:
+            chunk_count += 1
+            if ctx is not None:
+                # ``report_progress`` accepts a string message; chunks
+                # may be arbitrary JSON-serialisable values, so we
+                # stringify them deterministically for the wire.
+                try:
+                    msg = json.dumps(chunk, default=str)
+                except (TypeError, ValueError):
+                    msg = str(chunk)
+                # Progress notifications are best-effort: clients that
+                # didn't supply a progress token cause this to drop on
+                # the floor. Suppressing here keeps the action running
+                # in the face of a noisy/disconnected notification
+                # channel.
+                with contextlib.suppress(Exception):
+                    await ctx.report_progress(progress=chunk_count, message=msg)
+        final_chunk, final_state_dict = await container.get()
+    except TimeoutError as exc:
+        raise ActionTimeoutError(action_name, timeout_seconds or 0.0) from exc
+    except Exception as exc:
+        raise ActionExecutionError(action_name, exc) from exc
+
+    state, coerced = _serializable_state(_public_state(final_state_dict))  # type: ignore[arg-type]
+    if coerced:
+        state["_authiro"] = {"coerced_keys": coerced}
+    return {
+        "action": a.name,
+        "result": final_chunk,
+        "state": state,
+        "valid_next_actions": valid_next_action_names(app),
+        "app_id": app.uid,
+        "session": _session_key(ctx) if ctx is not None else None,
+        "tracker_project": _tracker_project(app),
+        "streamed": True,
+        "chunks": chunk_count,
+    }
+
+
+# Response builders + tracker predicate: see ``authiro._responses``.
+from authiro._responses import (  # noqa: E402
+    _emit_log,
+    _has_local_tracker,
+    _refusal_headline,
+    _step_tool_result,
+    _strict_errors,
+    _success_headline,
+)
+
+
+def _attach_hooks(app: Application[Any], hooks: list[Any]) -> None:
+    """Append Burr lifecycle adapters to an already-built ``Application``.
+
+    Burr's ``ApplicationBuilder.with_hooks(*)`` is the normal path; this
+    helper is the post-build version for callers that only see the built
+    Application (factories, deserialized apps). Uses Burr's public
+    ``LifecycleAdapterSet.with_new_adapters`` so we don't reach into
+    ``_adapters`` or ``_get_lifecycle_hooks`` ourselves; Burr does the
+    same in ``Application.__init__`` to wire its ``TracerFactoryContextHook``.
+    """
+    adapter_set = getattr(app, "_adapter_set", None)
+    if adapter_set is None:
+        return
+    app._adapter_set = adapter_set.with_new_adapters(*hooks)
+
+
+def _resolve_assembly_workflow(workflow: Any) -> Any:
+    """Turn an Assembly's ``workflow`` field into a built Application or factory."""
+    if not isinstance(workflow, str):
+        return workflow
+    import importlib
+
+    module_name, _, attr = workflow.partition(":")
+    return getattr(importlib.import_module(module_name), attr)
+
+
+def _mount_from_assembly(asm: Any, **kw: Any) -> FastMCP:
+    """Recurse into ``mount`` with the Assembly's fields, letting explicit kwargs win."""
+    workflow = _resolve_assembly_workflow(asm.workflow)
+    return mount(
+        workflow,
+        mode=kw["mode"],
+        name=kw["name"] if kw["name"] is not None else asm.name,
+        instructions=kw["instructions"] if kw["instructions"] is not None else asm.instructions,
+        include_default_instructions=kw["include_default_instructions"]
+        if not kw["include_default_instructions"]
+        else asm.include_default_instructions,
+        personas=kw["personas"] if kw["personas"] is not None else asm.personas,
+        default_persona=kw["default_persona"]
+        if kw["default_persona"] is not None
+        else asm.default_persona,
+        session_ttl_seconds=kw["session_ttl_seconds"],
+        max_sessions=kw["max_sessions"],
+        action_timeout_seconds=kw["action_timeout_seconds"],
+        input_validators=kw["input_validators"],
+        state_loader=kw["state_loader"],
+        next_hint=kw["next_hint"],
+        external_tools=kw["external_tools"],
+        upstream=kw["upstream"] if kw["upstream"] is not None else asm.upstream,
+        hooks=kw.get("hooks"),
+        middleware=kw.get("middleware"),
+    )
+
+
+def _silence_fastmcp_loggers() -> None:
+    """Quiet FastMCP's per-call DEBUG output unless AUTHIRO_VERBOSE is set.
+
+    FastMCP's notification log is useful when wiring a new client but noisy
+    in normal use. ``AUTHIRO_VERBOSE=1`` restores it.
+    """
+    if os.environ.get("AUTHIRO_VERBOSE"):
+        return
+    for _noisy in ("fastmcp", "mcp", "FastMCP"):
+        _lg = logging.getLogger(_noisy)
+        if _lg.level < logging.WARNING:
+            _lg.setLevel(logging.WARNING)
+
+
+def _subruns_index(entry: _SessionEntry) -> list[dict[str, Any]]:
+    """Build the ``authiro://subruns`` index for one session entry."""
+    # Reverse-map subrun_id -> the parent history entry that spawned it.
+    parent_action_for: dict[str, str] = {}
+    for h in entry.history:
+        for sid in h.get("subruns", []) or []:
+            parent_action_for[sid] = h["action"]
+    return [
+        {
+            "id": sid,
+            "uri": f"authiro://subruns/{sid}",
+            "label": record.get("label"),
+            "started_ts": record.get("started_ts"),
+            "ended_ts": record.get("ended_ts"),
+            "parent_action": parent_action_for.get(sid),
+            "error": record.get("error"),
+        }
+        for sid, record in entry.subruns.items()
+    ]
+
+
+def _pointer_dict(pointer: Any) -> dict[str, Any] | None:
+    """Serialize a Burr ``ParentPointer`` (fork/spawn lineage), or ``None``."""
+    if pointer is None:
+        return None
+    return {
+        "app_id": getattr(pointer, "app_id", None),
+        "partition_key": getattr(pointer, "partition_key", None),
+        "sequence_id": getattr(pointer, "sequence_id", None),
+    }
+
+
+def _session_coordinates(
+    app: Application[Any], fastmcp_session_id: str | None = None
+) -> dict[str, Any]:
+    """Build the ``authiro://session`` payload: tracker coordinates.
+
+    ``project`` and ``app_dir`` are null when no ``LocalTrackingClient``
+    is attached; ``app_id`` and ``partition_key`` are always populated
+    because they live on the Application directly. ``fastmcp_session_id`` is the
+    stable FastMCP session key (equal to ``app_id`` for a builder factory, but
+    distinct for a built-Application factory). ``tracker_project`` mirrors
+    ``project`` under the step-payload key so a client can reconstruct
+    ``app_dir`` from project + app_id. ``persisted`` is whether the session has
+    flushed to disk yet (false until the first step under lazy tracking), so a
+    client can show "no trace yet" instead of pointing at a missing dir.
+    ``sequence_id`` and ``current_action`` (the action auto-routing would run
+    next) track run progress. ``parent`` / ``spawning_parent`` give *this*
+    mounted app's own fork/spawn ancestry, which is null for a root session (the
+    usual case) and populated only when the mounted Application was built with a
+    parent/spawning pointer. To see the descendants a session spawned, read
+    ``authiro://children`` (the populated direction for a fan-out).
+    """
+    project: str | None = None
+    app_dir: str | None = None
+    try:
+        from burr.tracking.client import LocalTrackingClient
+    except ImportError:
+        LocalTrackingClient = None  # type: ignore[assignment,misc]
+    tracker = getattr(app, "_tracker", None)
+    if LocalTrackingClient is not None and isinstance(tracker, LocalTrackingClient):
+        project = tracker.project_id
+        try:
+            storage_dir = Path(tracker.storage_dir).expanduser().resolve()
+            app_dir = str((storage_dir / app.uid).resolve())
+        except (OSError, AttributeError):
+            app_dir = None
+    try:
+        next_action = app.get_next_action()
+    except Exception:
+        next_action = None
+    persisted = app_dir is not None and Path(app_dir).exists()
+    return {
+        "project": project,
+        "app_id": app.uid,
+        "app_dir": app_dir,
+        "partition_key": getattr(app, "_partition_key", None),
+        "fastmcp_session_id": fastmcp_session_id,
+        "tracker_project": project,
+        "persisted": persisted,
+        "sequence_id": app.sequence_id,
+        "current_action": next_action.name if next_action is not None else None,
+        "parent": _pointer_dict(app.parent_pointer),
+        "spawning_parent": _pointer_dict(app.spawning_parent_pointer),
+    }
+
+
+def _source_payload(app: Application[Any], action: str) -> str:
+    """JSON body for ``authiro://source/{action}``: source, or a typed error."""
+    actions = {a.name: a for a in app.graph.actions}
+    target = actions.get(action)
+    if target is None:
+        return json.dumps(
+            {"error": "unknown_action", "action": action, "known_actions": list(actions)},
+            indent=2,
+        )
+    try:
+        source = target.get_source()
+    except (OSError, TypeError) as exc:
+        return json.dumps(
+            {"error": "source_unavailable", "action": action, "reason": str(exc)}, indent=2
+        )
+    return json.dumps({"action": action, "source": source}, indent=2)
+
+
+def _tracker_file_payload(path: Any, resource_uri: str) -> str:
+    """JSON body for a tracker-file resource (trace/children): error, ``[]``, or records."""
+    if path is None:
+        return json.dumps(
+            {
+                "error": "no_tracker",
+                "message": (
+                    "This Application has no LocalTrackingClient attached. Pass "
+                    "tracker=LocalTrackingClient(project='...') to "
+                    f"ApplicationBuilder.with_tracker(...) to enable {resource_uri}."
+                ),
+            },
+            indent=2,
+        )
+    if not path.exists():
+        return json.dumps([])
+    return json.dumps(_read_trace(path), default=str, indent=2)
+
+
+async def _upstreams_payload(upstream_manager: Any, per_session_config: Any) -> str:
+    """JSON for ``authiro://upstreams``: configured upstreams + health/mode."""
+    if per_session_config is not None:
+        names = sorted(per_session_config) if isinstance(per_session_config, dict) else []
+        return json.dumps(
+            {
+                "mode": "per_session",
+                "servers": names,
+                "note": "per-session upstreams open a client per MCP session; not pinged here",
+            },
+            indent=2,
+        )
+    if upstream_manager is None:
+        return json.dumps({"mode": "none", "servers": []}, indent=2)
+    health_fn = getattr(upstream_manager, "health", None)
+    if health_fn is None:
+        names = getattr(upstream_manager, "server_names", [])
+        return json.dumps({"mode": "shared", "servers": names}, indent=2)
+    return json.dumps({"mode": "shared", "upstreams": await health_fn()}, indent=2, default=str)
+
+
+def _register_resources(
+    mcp: FastMCP,
+    *,
+    store: _SessionStore,
+    shared_app: Application[Any],
+    shared_lock: asyncio.Lock,
+    factory: ApplicationFactory | None,
+    graph_summary_json: str,
+    graph_summary: dict[str, Any],
+    upstream_manager: Any = None,
+    upstream_per_session_config: Any = None,
+) -> None:
+    """Register the ``authiro://`` read-only resource surface on ``mcp``."""
+
+    @mcp.resource("authiro://graph")
+    async def _graph_resource() -> str:
+        """Static description of the Application's FSM topology.
+
+        Read once per session. The graph doesn't change after mount;
+        a model that has this resource doesn't need to keep polling
+        ``authiro://next`` to plan ahead. Each tool response already
+        carries the current state and the valid next actions, so
+        runtime polling is only useful for forensic inspection of an
+        already-running session.
+
+        Shape:
+
+            {
+              "name": "<server name>",
+              "entrypoint": "<starting action>",
+              "actions": [
+                {"name", "description", "reads", "writes",
+                 "required_inputs", "optional_inputs"}, ...
+              ],
+              "transitions": [
+                {"from", "to", "condition": "<expr or null>"}, ...
+              ]
+            }
+        """
+        return graph_summary_json
+
+    @mcp.resource("authiro://graph/tag/{tag}")
+    async def _graph_by_tag_resource(tag: str) -> str:
+        """Actions carrying ``tag``, as a lens over ``authiro://graph``.
+
+        Returns ``{name, entrypoint, tag, actions, matched}`` where
+        ``actions`` is the subset of the topology whose ``tags`` include
+        ``tag``, each with its full metadata block. Transitions are
+        omitted: this is a filter over the action set, not a sub-graph.
+        An unknown tag returns an empty ``actions`` list, not an error.
+        """
+        return json.dumps(_graph_actions_by_tag(graph_summary, tag), indent=2)
+
+    @mcp.resource("authiro://graph/mermaid")
+    async def _graph_mermaid_resource() -> str:
+        """The FSM as Mermaid ``stateDiagram-v2`` source (with conditions).
+
+        A renderable view of the same topology ``authiro://graph`` returns
+        as JSON. Paste into any Mermaid renderer, or let a UI draw the graph
+        without reimplementing the layout. Static; the graph doesn't change
+        after mount.
+        """
+        topo = _topology_from_app(shared_app, graph_summary.get("name", "authiro"))
+        return _render_mermaid(topo, conditions=True)
+
+    @mcp.resource("authiro://graph/dot")
+    async def _graph_dot_resource() -> str:
+        """The FSM as Graphviz DOT source (with conditions).
+
+        Same topology as ``authiro://graph/mermaid``, for Graphviz-based
+        renderers. Static.
+        """
+        topo = _topology_from_app(shared_app, graph_summary.get("name", "authiro"))
+        return _render_dot(topo, conditions=True)
+
+    @mcp.resource("authiro://source/{action}")
+    async def _source_resource(action: str) -> str:
+        """Python source of a single action, via Burr's ``Action.get_source()``.
+
+        Lets a client inspect what an action actually does without leaving the
+        session. Returns ``{"action", "source"}`` on success; an
+        ``unknown_action`` error (with the known names) for a bad name; or a
+        ``source_unavailable`` error when the source can't be read (e.g. an
+        action defined in a REPL or a ``lambda``).
+        """
+        return _source_payload(shared_app, action)
+
+    @mcp.resource("authiro://state")
+    async def _state_resource(ctx: Context) -> str:
+        """Current Application state as JSON.
+
+        Internal Burr keys (``__PRIOR_STEP``, ``__SEQUENCE_ID``) are
+        filtered. Non-JSON-representable values are coerced to strings,
+        with the affected keys listed under ``_authiro.coerced_keys``
+        so the client knows the round-trip is lossy.
+        """
+        app, _, _ = _session_app_and_lock(ctx, shared_app, shared_lock, factory, store)
+        state, coerced = _serializable_state(_public_state(app.state.get_all()))
+        if coerced:
+            state["_authiro"] = {"coerced_keys": coerced}
+        return json.dumps(state, indent=2)
+
+    @mcp.resource("authiro://next")
+    async def _next_resource(ctx: Context) -> str:
+        """Action names reachable from the current state.
+
+        For non-branching graphs this is one name. For branching graphs,
+        all conditionally-reachable next actions are listed. After a
+        terminal action this is an empty list, meaning the FSM is done.
+        """
+        app, _, _ = _session_app_and_lock(ctx, shared_app, shared_lock, factory, store)
+        return json.dumps(valid_next_action_names(app))
+
+    @mcp.resource("authiro://history")
+    async def _history_resource(ctx: Context) -> str:
+        """Timeline of every action attempted in this session.
+
+        The payload is a JSON array (no wrapper object) of entries each
+        carrying ``seq``, ``ts``, ``action``, ``inputs``, ``state_after``,
+        ``valid_next_actions``, ``refused``, and ``refusal_reason``. Both
+        successful steps and refused attempts (invalid transitions, unknown
+        actions) appear. In factory-mode deployments each session sees only
+        its own history; in shared-app deployments each session sees the
+        timeline of its own calls against the shared FSM.
+        """
+        history = store.history(_session_key(ctx)) if ctx is not None else []
+        return json.dumps(history, default=str, indent=2)
+
+    @mcp.resource("authiro://subruns")
+    async def _subruns_resource(ctx: Context) -> str:
+        """Index of sub-Application runs spawned in this session.
+
+        Each entry has ``id``, ``uri``, ``label``, ``started_ts``,
+        ``ended_ts``, and the ``parent_action`` that spawned it. The
+        ``uri`` field is the fully-rendered ``authiro://subruns/{id}``
+        address, ready to read without constructing it from a template.
+        Empty list if no actions in this session called
+        ``spawn_subapp``.
+        """
+        if ctx is None:
+            return json.dumps([])
+        entry = store.get_or_create(_session_key(ctx), factory)
+        return json.dumps(_subruns_index(entry), default=str, indent=2)
+
+    @mcp.resource("authiro://subruns/{subrun_id}")
+    async def _subrun_detail_resource(subrun_id: str, ctx: Context) -> str:
+        """Full record for one sub-Application run.
+
+        Includes the sub-run's id, label, parent-spawning timestamps,
+        in-memory history of the sub-graph's steps, final public
+        state, and any error that aborted the run. Returns
+        ``{"error": "unknown_subrun"}`` if the id isn't known to this
+        session.
+        """
+        if ctx is None:
+            return json.dumps({"error": "no_session"})
+        entry = store.get_or_create(_session_key(ctx), factory)
+        record = entry.subruns.get(subrun_id)
+        if record is None:
+            return json.dumps(
+                {
+                    "error": "unknown_subrun",
+                    "subrun_id": subrun_id,
+                    "known_subruns": list(entry.subruns),
+                },
+                indent=2,
+            )
+        return json.dumps(record, default=str, indent=2)
+
+    @mcp.resource("authiro://trace")
+    async def _trace_resource(ctx: Context) -> str:
+        """Burr's on-disk LocalTrackingClient log for this session's Application.
+
+        Returns the JSONL records Burr writes for every action step
+        (action enter/exit, state diff, timing). The Application must
+        have been built with ``.with_tracker(LocalTrackingClient(...))``
+        for this resource to return data; otherwise the response is
+        ``{"error": "no_tracker", "message": "..."}``.
+
+        Responses are capped at the most recent 1000 records to keep
+        the wire payload bounded. For full traces, read the log file
+        directly off disk at the path Burr's tracker writes to.
+
+        This is the cross-reference between authiro's in-memory
+        ``authiro://history`` (one entry per attempted action, including
+        refusals) and Burr's own structured trace format (one entry
+        per state transition, full Burr replay shape).
+        """
+        app, _, _ = _session_app_and_lock(ctx, shared_app, shared_lock, factory, store)
+        return _tracker_file_payload(_tracker_log_path(app), "authiro://trace")
+
+    @mcp.resource("authiro://children")
+    async def _children_resource(ctx: Context) -> str:
+        """Burr-native sub-applications spawned or forked from this session.
+
+        When an action spawns a sub-Application via Burr's
+        ``with_spawning_parent`` (or forks one), Burr appends a record to
+        ``children.jsonl`` in this session's tracker dir. This surfaces those
+        native children: each entry carries the child ``app_id``, an
+        ``event_type`` (Burr emits ``spawn_start`` for a spawn, ``fork`` for a
+        fork), the parent ``sequence_id`` at which the link was made, and
+        ``event_time``.
+
+        This is distinct from ``authiro://subruns``, which indexes sub-runs
+        started through Authiro's own ``spawn_subapp`` helper. Use this one
+        to follow children created by Burr directly inside your action code.
+
+        Native children resolve only when the child's tracker shares this
+        app's ``storage_dir`` and project: Burr writes the link to
+        ``<child storage_dir>/<parent app_id>/children.jsonl``. A child built
+        with a different ``tracker()`` project writes its link elsewhere and
+        won't appear here.
+
+        Returns ``{"error": "no_tracker", ...}`` when no LocalTrackingClient
+        is attached, and ``[]`` when nothing has been spawned yet.
+        """
+        app, _, _ = _session_app_and_lock(ctx, shared_app, shared_lock, factory, store)
+        return _tracker_file_payload(_children_path(app), "authiro://children")
+
+    @mcp.resource("authiro://upstreams")
+    async def _upstreams_resource() -> str:
+        """Configured upstream MCP servers this FSM drives, and their health.
+
+        These are the servers reachable from action bodies via
+        ``call_upstream`` (the agent never sees their tools directly). For
+        shared upstreams, each is pinged (opened, tools listed) so a
+        misconfigured server surfaces here rather than mid-run as an action
+        failure: ``{server, status: "ok"|"error", tools | error}``. For
+        per-session upstreams (config carrying a ``{session}`` placeholder)
+        only the configured names and mode are returned, since pinging would
+        spawn a session-scoped client. ``{"mode": "none"}`` when no upstream
+        is configured.
+        """
+        return await _upstreams_payload(upstream_manager, upstream_per_session_config)
+
+    @mcp.resource("authiro://session")
+    async def _session_resource(ctx: Context) -> str:
+        """Tracker coordinates for the current MCP session's Application.
+
+        Returns ``{project, app_id, app_dir, partition_key}`` so a client
+        (or the agent itself) can locate this session's tracker data on
+        disk without guessing. Useful for terminal tooling like
+        ``authiro watch <project>`` that tails the LocalTrackingClient
+        JSONL, and for any out-of-band inspection of
+        ``~/.burr/<project>/<app-id>/log.jsonl``.
+
+        ``project`` and ``app_dir`` are null when no
+        ``LocalTrackingClient`` is attached; ``app_id`` and
+        ``partition_key`` are always populated because they live on the
+        Application directly.
+        """
+        app, _, _ = _session_app_and_lock(ctx, shared_app, shared_lock, factory, store)
+        fastmcp_session_id = _session_key(ctx) if ctx is not None else None
+        return json.dumps(_session_coordinates(app, fastmcp_session_id), indent=2)
+
+
+def _register_personas(
+    mcp: FastMCP,
+    *,
+    personas_map: dict[str, Any],
+    persona: Any | None,
+    store: _SessionStore,
+    factory: ApplicationFactory | None,
+) -> None:
+    """Register persona resources and one MCP prompt per persona."""
+    if not personas_map:
+        return
+    if personas_map:
+
+        @mcp.resource("authiro://personas")
+        async def _personas_resource() -> str:
+            """Index of personas mounted on this server.
+
+            Returns ``{name: {description, voice, has_metadata}}`` so a client
+            can list available identities without fetching every body. Each
+            persona is also registered as an MCP prompt named
+            ``authiro/persona/<name>``; ``prompts/get`` returns the body.
+            """
+            return json.dumps(
+                {
+                    p.name: {
+                        "description": p.description,
+                        "voice": p.voice,
+                        "has_metadata": bool(p.metadata),
+                    }
+                    for p in personas_map.values()
+                },
+                indent=2,
+            )
+
+        if persona is not None:
+            default_name = persona.name
+
+            @mcp.resource("authiro://persona")
+            async def _active_persona_resource() -> str:
+                """The persona currently active for this server.
+
+                Whichever persona was chosen at mount time via
+                ``default_persona=`` (or, if not specified, the lexically
+                first persona in the loaded directory).
+                """
+                p = personas_map[default_name]
+                return json.dumps(
+                    {
+                        "name": p.name,
+                        "description": p.description,
+                        "voice": p.voice,
+                        "body": p.body,
+                        "metadata": p.metadata,
+                    },
+                    indent=2,
+                )
+
+        # Each persona becomes an MCP prompt. ``ctx: Context`` is the
+        # FastMCP convention for server-injected context (without the
+        # annotation it would be advertised as a required client argument).
+        # When a session is active the body is interpolated against the
+        # current frame; unknown placeholders render as empty strings.
+        for _persona in personas_map.values():
+            _name = f"authiro/persona/{_persona.name}"
+            _desc = _persona.description or f"Persona: {_persona.name}"
+
+            def _make_prompt_fn(persona_obj: Any) -> Callable[[Context], Any]:
+                async def _persona_prompt_fn(ctx: Context) -> str:
+                    frame = _build_persona_frame(ctx, store, factory)
+                    return str(persona_obj.to_prompt_text(frame=frame))
+
+                return _persona_prompt_fn
+
+            mcp.prompt(name=_name, description=_desc)(_make_prompt_fn(_persona))
+
+
+def _with_next_guidance(
+    response: dict[str, Any],
+    *,
+    state: dict[str, Any],
+    valid_next: list[str],
+    last_action: str,
+    refusal: dict[str, Any] | None,
+    next_hint: Callable[..., str | None] | None,
+    external_tools_map: dict[str, list[str]],
+) -> dict[str, Any]:
+    """Append ``next_hint`` and ``next_external_tools`` to a step response.
+
+    Every step outcome (success, refusal, unknown action) carries the same
+    two guidance fields; this is the single place they are composed.
+    """
+    hint = _compose_next_hint(
+        state=state,
+        valid_next=valid_next,
+        last_action=last_action,
+        refusal=refusal,
+        domain_callback=next_hint,
+    )
+    if hint:
+        response = response | {"next_hint": hint}
+    if external_tools_map:
+        net = _next_external_tools(external_tools_map, valid_next)
+        if net:
+            response = response | {"next_external_tools": net}
+    return response
+
+
+async def _handle_unknown_action(
+    *,
+    action: str,
+    inputs: dict[str, Any] | None,
+    seq: int,
+    ctx: Context | None,
+    store: _SessionStore,
+    shared_app: Application[Any],
+    shared_lock: asyncio.Lock,
+    factory: ApplicationFactory | None,
+    action_names: list[str],
+    next_hint: Callable[..., str | None] | None,
+    external_tools_map: dict[str, list[str]],
+) -> ToolResult:
+    """Refuse a hallucinated action name with self-correcting guidance.
+
+    A hallucinated action name is the refusal a weaker model is most
+    likely to hit. Steer it the same way an invalid_transition does:
+    resolve the session's current Application, report what's reachable
+    now, and run the reactive-hint path so the response is
+    self-correcting on its own. ``known_actions`` stays for spotting
+    typos.
+    """
+    app, _, _ = _session_app_and_lock(ctx, shared_app, shared_lock, factory, store)
+    valid = valid_next_action_names(app)
+    response: dict[str, Any] = {
+        "error": "unknown_action",
+        "session": _session_key(ctx) if ctx is not None else None,
+        "requested": action,
+        "known_actions": action_names,
+        "valid_next_actions": valid,
+        "next_action_schemas": _next_action_schemas(app, valid),
+        "message": (
+            f"unknown action {action!r}. Reachable actions from the current state: {valid}."
+        ),
+    }
+    state_for_hint, _ = _serializable_state(_public_state(app.state.get_all()))
+    response = _with_next_guidance(
+        response,
+        state=state_for_hint,
+        valid_next=valid,
+        last_action=action,
+        refusal=response,
+        next_hint=next_hint,
+        external_tools_map=external_tools_map,
+    )
+    _record_history(
+        store,
+        ctx,
+        factory,
+        action=action,
+        inputs=inputs or {},
+        state_after=None,
+        valid_next_actions=valid,
+        refused=True,
+        refusal_reason="unknown_action",
+        app=app,
+    )
+    headline = f"Step {seq}: {action} × unknown_action"
+    await _emit_log(ctx, headline)
+    return _step_tool_result(response, headline)
+
+
+async def _handle_step_refusal(
+    exc: Exception,
+    *,
+    action: str,
+    inputs: dict[str, Any] | None,
+    seq: int,
+    ctx: Context | None,
+    app: Application[Any],
+    store: _SessionStore,
+    factory: ApplicationFactory | None,
+    next_hint: Callable[..., str | None] | None,
+    external_tools_map: dict[str, list[str]],
+) -> ToolResult:
+    """Turn a step-side refusal exception into the structured wire response.
+
+    Reactive hint on refusal -- the FSM teaches the agent why the call
+    was blocked plus what's reachable now.
+    """
+    response, hist_kwargs = _refusal_payload(exc=exc, action_name=action, app=app)
+    if ctx is not None:
+        response["session"] = _session_key(ctx)
+    state_for_hint, _ = _serializable_state(_public_state(app.state.get_all()))
+    response = _with_next_guidance(
+        response,
+        state=state_for_hint,
+        valid_next=response.get("valid_next_actions") or [],
+        last_action=action,
+        refusal=response,
+        next_hint=next_hint,
+        external_tools_map=external_tools_map,
+    )
+    _record_history(
+        store,
+        ctx,
+        factory,
+        action=action,
+        inputs=inputs or {},
+        state_after=None,
+        app=app,
+        **hist_kwargs,
+    )
+    headline = _refusal_headline(
+        seq,
+        action,
+        response["error"],
+        detail=response.get("error_type", "") or "",
+    )
+    await _emit_log(ctx, headline)
+    # action_error / action_timeout are genuine execution failures; the FSM
+    # guidance refusals (invalid_transition, validation_failed, unknown_action)
+    # carry valid_next_actions for self-correction and are not errors by
+    # default. AUTHIRO_STRICT_ERRORS flips guidance refusals to MCP errors too
+    # (keeping the payload), so a framework's tool-error routing fires on them.
+    is_error = isinstance(exc, (ActionExecutionError, ActionTimeoutError)) or _strict_errors()
+    return _step_tool_result(response, headline, is_error=is_error)
+
+
+async def _finish_step_success(
+    out: dict[str, Any],
+    *,
+    action: str,
+    inputs: dict[str, Any] | None,
+    seq: int,
+    ctx: Context | None,
+    app: Application[Any],
+    entry: _SessionEntry | None,
+    subruns_before: set[str],
+    store: _SessionStore,
+    factory: ApplicationFactory | None,
+    next_hint: Callable[..., str | None] | None,
+    external_tools_map: dict[str, list[str]],
+) -> ToolResult:
+    """Record and shape a successful step's wire response.
+
+    Reactive hint on success -- FSM-derived guidance for the next move.
+    Auto-hint enumerates reachable actions; the domain callback can
+    override with semantic-rich guidance.
+    """
+    new_subruns: list[str] = []
+    if entry is not None:
+        new_subruns = [s for s in entry.subruns if s not in subruns_before]
+    out = _with_next_guidance(
+        out,
+        state=out["state"],
+        valid_next=out["valid_next_actions"],
+        last_action=action,
+        refusal=None,
+        next_hint=next_hint,
+        external_tools_map=external_tools_map,
+    )
+    _record_history(
+        store,
+        ctx,
+        factory,
+        action=action,
+        inputs=inputs or {},
+        state_after=out["state"],
+        valid_next_actions=out["valid_next_actions"],
+        subruns=new_subruns or None,
+        app=app,
+    )
+    out["next_action_schemas"] = _next_action_schemas(app, out["valid_next_actions"])
+    headline = _success_headline(seq, action, out["valid_next_actions"])
+    await _emit_log(ctx, headline)
+    return _step_tool_result(out, headline)
+
+
+def _coerce_inputs_arg(inputs: dict[str, Any] | str | None) -> dict[str, Any] | None:
+    """Coerce a JSON-string ``inputs`` into a dict; None when unparseable.
+
+    The schema advertises both forms so clients that validate against the
+    schema don't reject the string-encoded path before sending the request.
+    """
+    if not isinstance(inputs, str):
+        return inputs
+    try:
+        parsed = json.loads(inputs)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+async def _resolve_session_upstream(
+    store: _SessionStore,
+    shared_manager: Any,
+    per_session_config: Any,
+    entry: Any,
+    session_id: str,
+) -> Any:
+    """The upstream manager to bind for one step.
+
+    Shared mode: the one ``shared_manager``. Per-session mode (config carries a
+    ``{session}`` placeholder): the entry's own manager, built lazily from the
+    placeholder-substituted config so each session gets an isolated
+    client/subprocess/state file. Also closes managers left by evicted sessions.
+    """
+    for stale in store.take_closables():
+        with contextlib.suppress(Exception):
+            await stale.aclose()
+    if per_session_config is None or entry is None:
+        return shared_manager
+    if entry.upstream is None:
+        from authiro.upstream import substitute_session
+
+        entry.upstream = UpstreamManager(substitute_session(per_session_config, session_id))
+    return entry.upstream
+
+
+def _register_step_tool(
+    mcp: FastMCP,
+    *,
+    store: _SessionStore,
+    shared_app: Application[Any],
+    shared_lock: asyncio.Lock,
+    factory: ApplicationFactory | None,
+    action_timeout_seconds: float | None,
+    input_validators: dict[str, Callable[..., Any]] | None,
+    upstream_manager: Any,
+    upstream_per_session_config: Any = None,
+    external_tools_map: dict[str, list[str]],
+    next_hint: Callable[..., str | None] | None,
+    action_surface: str,
+) -> None:
+    """Register ``step``, the single transition gate, on ``mcp``."""
+    action_names = [a.name for a in shared_app.graph.actions]
+    action_map = {a.name: a for a in shared_app.graph.actions}
+
+    async def step(
+        action: str,
+        inputs: dict[str, Any] | str | None = None,
+        session: str | None = None,
+        ctx: Context | None = None,
+    ) -> ToolResult:
+        """Advance the FSM by one transition.
+
+        How to drive this from an agent that only sees tools: every result
+        carries ``valid_next_actions`` (what you may call next) and
+        ``next_action_schemas`` (the exact inputs each of those takes, including
+        nested object shapes). Pick the next ``action`` from
+        ``valid_next_actions`` and supply ``inputs`` from its
+        ``next_action_schemas`` entry. A ``×`` refusal
+        (``invalid_transition`` / ``validation_failed`` / ``unknown_action``)
+        is not a crash: read ``error`` and ``valid_next_actions`` and retry
+        with a valid call. The action list below shows the entry actions and
+        their inputs to get you started.
+
+        Args:
+            action: Name of the action to run. Must be in the
+                current valid-next set; otherwise the call returns
+                an ``invalid_transition`` error with the list of
+                actions actually allowed right now.
+            inputs: Keyword inputs to the action. Each action
+                declares its own required + optional inputs;
+                consult ``authiro://next`` and the action's docstring
+                to see what's expected. Object is the canonical
+                form. A JSON-encoded string is also accepted (some
+                clients serialize nested object arguments that way)
+                and is parsed into an object before dispatch.
+            session: Session handle for continuing a session across
+                calls. Every step result carries ``session``; pass it
+                back here on subsequent calls. Omit on the first call
+                (a session is created) and on transports that keep a
+                protocol-level session.
+            ctx: Server-injected FastMCP request context; never supplied
+                by the client.
+        """
+        if session is not None:
+            # Set-without-reset is safe: each MCP request dispatches in its
+            # own task, so the contextvar dies with the request. It must stay
+            # live past this frame because the response builders and history
+            # recorder resolve the session key after step's finally runs.
+            _session_handle.set(session)
+        # Coerce a JSON-string inputs into a dict so the body always
+        # sees the canonical shape.
+        inputs = _coerce_inputs_arg(inputs)
+        # Peek the seq that this call's history entry will get, so
+        # the ctx.info headline matches the recorded seq.
+        seq = len(store.history(_session_key(ctx))) if ctx is not None else 0
+        if action not in action_map:
+            return await _handle_unknown_action(
+                action=action,
+                inputs=inputs,
+                seq=seq,
+                ctx=ctx,
+                store=store,
+                shared_app=shared_app,
+                shared_lock=shared_lock,
+                factory=factory,
+                action_names=action_names,
+                next_hint=next_hint,
+                external_tools_map=external_tools_map,
+            )
+        app, lock, entry = _session_app_and_lock(ctx, shared_app, shared_lock, factory, store)
+        effective_timeout = _action_timeout(action_map[action], action_timeout_seconds)
+        effective_validator = _action_validator(action_map[action], input_validators)
+        token = _current_session_entry.set(entry)
+        ctx_token = _current_fastmcp_context.set(ctx)
+        session_manager = await _resolve_session_upstream(
+            store,
+            upstream_manager,
+            upstream_per_session_config,
+            entry,
+            _session_key(ctx) if ctx else "",
+        )
+        upstream_token = bind_upstream(session_manager) if session_manager else None
+        subruns_before = set(entry.subruns) if entry is not None else set()
+        try:
+            async with lock:
+                out = await _step_application(
+                    app,
+                    action_name=action,
+                    inputs=inputs or {},
+                    timeout_seconds=effective_timeout,
+                    validator=effective_validator,
+                    ctx=ctx,
+                )
+        except (
+            ValidationFailed,
+            InvalidTransitionError,
+            ActionTimeoutError,
+            ActionExecutionError,
+        ) as exc:
+            return await _handle_step_refusal(
+                exc,
+                action=action,
+                inputs=inputs,
+                seq=seq,
+                ctx=ctx,
+                app=app,
+                store=store,
+                factory=factory,
+                next_hint=next_hint,
+                external_tools_map=external_tools_map,
+            )
+        finally:
+            _current_session_entry.reset(token)
+            _current_fastmcp_context.reset(ctx_token)
+            if upstream_token is not None:
+                reset_upstream(upstream_token)
+        return await _finish_step_success(
+            out,
+            action=action,
+            inputs=inputs,
+            seq=seq,
+            ctx=ctx,
+            app=app,
+            entry=entry,
+            subruns_before=subruns_before,
+            store=store,
+            factory=factory,
+            next_hint=next_hint,
+            external_tools_map=external_tools_map,
+        )
+
+    # Constrain the action parameter to the actual graph's action names so
+    # the tool schema advertises an enum. Weak models otherwise hallucinate
+    # plausible-sounding action names (e.g. "Start the workflow.") and
+    # never recover; verified in the floor test (qwen3:0.6b went from 0/10
+    # to 10/10 once the enum was present). The injection is via Pydantic's
+    # Field(json_schema_extra=...) on an Annotated wrapper so FastMCP's
+    # schema generator picks it up without us forking the type hint.
+    step.__annotations__["action"] = Annotated[
+        str,
+        pydantic.Field(
+            description=(
+                "Name of the action to run. Must be one of the listed "
+                "values; calling an out-of-state value returns an "
+                "invalid_transition error with the current valid set."
+            ),
+            json_schema_extra={"enum": action_names.copy()},  # type: ignore[dict-item]
+        ),
+    ]
+    from mcp.types import ToolAnnotations
+
+    step_description = f"{step.__doc__}\n\n{action_surface}"
+    mcp.tool(
+        name="step",
+        description=step_description,
+        output_schema=_step_response_schema(),
+        annotations=ToolAnnotations(
+            title="Take one FSM transition",
+            # Each call advances the session's state machine.
+            destructiveHint=True,
+            idempotentHint=False,
+            openWorldHint=False,
+        ),
+    )(step)
+
+
+def _register_reset_tool(
+    mcp: FastMCP,
+    *,
+    store: _SessionStore,
+    factory: ApplicationFactory | None,
+) -> None:
+    """Register the ``reset_session`` meta tool on ``mcp``.
+
+    Always callable regardless of FSM state. Only meaningful in factory
+    mode; refuses in shared-app mode. The discovery hint in the server
+    instructions advertises it so the agent doesn't have to ask the human
+    to restart the server when it reaches a terminal node and wants to
+    try another path.
+    """
+    # Always callable regardless of FSM state. Only meaningful in
+    # factory mode; refuses in shared-app mode. The discovery hint in
+    # ``instructions`` advertises it so the agent doesn't have to ask
+    # the human to restart the server when it reaches a terminal node
+    # and wants to try another path.
+
+    async def reset_session(
+        session: str | None = None, ctx: Context | None = None
+    ) -> ToolResult | dict[str, Any]:
+        """Reset this session's FSM to its entrypoint.
+
+        ``session`` is the same handle ``step`` takes: pass the ``app_id``
+        from a previous result to reset that session on sessionless
+        connections.
+
+        Rebuilds the session's Application via the factory, clears any
+        sub-runs the session spawned, and appends a ``reset_session``
+        marker entry to ``authiro://history``. Prior history entries are
+        preserved, so the audit trail records the reset rather than
+        wiping it: ``ran A -> ran B -> reset -> ran A again``.
+
+        Refuses in shared-app mode (servers mounted with an
+        ``Application`` instance rather than a factory) because
+        resetting would affect every connected client at once. Use
+        per-session isolation (factory mode) for servers where reset
+        matters.
+        """
+        if factory is None:
+            return _step_tool_result(
+                {
+                    "error": "reset_not_supported",
+                    "reason": (
+                        "this server runs in shared-app mode (no factory was passed "
+                        "to mount); resetting would affect every connected client. "
+                        "Disconnect and reconnect for a fresh session, or remount "
+                        "the server with a factory: mount(() -> Application, ...)"
+                    ),
+                },
+                "reset_session × shared-app mode",
+            )
+        if ctx is None:
+            return _step_tool_result({"error": "no_session"}, "reset_session × no_session")
+        if session is not None:
+            _session_handle.set(session)
+
+        entry = store.get_or_create(_session_key(ctx), factory)
+        async with entry.lock:
+            previous_state, _ = _serializable_state(
+                _public_state(entry.application.state.get_all())
+                if entry.application is not None
+                else {}
+            )
+            entry.application = factory(_session_key(ctx))
+            entry.subruns.clear()
+            new_app = entry.application
+            assert new_app is not None
+            new_state, coerced = _serializable_state(_public_state(new_app.state.get_all()))
+            if coerced:
+                new_state["_authiro"] = {"coerced_keys": coerced}
+            valid_next = valid_next_action_names(new_app)
+            entry.last_access = time.monotonic()
+
+        _record_history(
+            store,
+            ctx,
+            factory,
+            action="reset_session",
+            inputs={},
+            state_after=new_state,
+            valid_next_actions=valid_next,
+            app=new_app,
+        )
+
+        headline = f"Session reset → {new_app.entrypoint}"
+        await _emit_log(ctx, headline)
+        return _step_tool_result(
+            {
+                "action": "reset_session",
+                "result": {"previous_state": previous_state},
+                "state": new_state,
+                "valid_next_actions": valid_next,
+                "app_id": new_app.uid,
+                "session": _session_key(ctx),
+                "tracker_project": _tracker_project(new_app),
+            },
+            headline,
+        )
+
+    from mcp.types import ToolAnnotations
+
+    mcp.tool(
+        name="reset_session",
+        description=reset_session.__doc__,
+        annotations=ToolAnnotations(
+            title="Reset this session",
+            destructiveHint=True,  # discards the session's state and history
+            idempotentHint=True,  # repeated resets are no-ops after the first
+            openWorldHint=False,
+        ),
+    )(reset_session)
+
+
+def _fork_target_refusal(entry: _SessionEntry, sequence_id: int) -> ToolResult | None:
+    """Validate a ``fork_at`` target history entry; a refusal or ``None``.
+
+    Refuses out-of-range ids, refusal entries (no state to restore), and
+    fork/reset marker entries (avoid walking a hall of mirrors).
+    """
+    if sequence_id < 0 or sequence_id >= len(entry.history):
+        return _step_tool_result(
+            {
+                "error": "unknown_sequence_id",
+                "requested": sequence_id,
+                "history_length": len(entry.history),
+            },
+            f"fork_at × unknown_sequence_id ({sequence_id})",
+        )
+    target = entry.history[sequence_id]
+    if target.get("refused"):
+        return _step_tool_result(
+            {
+                "error": "cannot_fork_to_refusal",
+                "sequence_id": sequence_id,
+                "refusal_reason": target.get("refusal_reason"),
+            },
+            f"fork_at × cannot_fork_to_refusal (seq={sequence_id})",
+        )
+    if target.get("action") in {"fork_at", "reset_session"}:
+        return _step_tool_result(
+            {
+                "error": "cannot_fork_to_meta_entry",
+                "sequence_id": sequence_id,
+                "action": target.get("action"),
+            },
+            f"fork_at × cannot_fork_to_meta_entry (seq={sequence_id})",
+        )
+    if target.get("state_after") is None:
+        return _step_tool_result(
+            {"error": "no_state_snapshot", "sequence_id": sequence_id},
+            f"fork_at × no_state_snapshot (seq={sequence_id})",
+        )
+    return None
+
+
+def _register_fork_at_tool(
+    mcp: FastMCP,
+    *,
+    store: _SessionStore,
+    factory: ApplicationFactory | None,
+) -> None:
+    """Register the ``fork_at`` meta tool on ``mcp``.
+
+    Rewinds the session's Application to the state captured after a
+    specific history entry, letting an agent explore "what if" branches
+    without disconnecting and losing context. Implemented via the
+    in-memory history rather than Burr's tracker-based replay so it works
+    without requiring users to wire up a LocalTrackingClient.
+    """
+    from mcp.types import ToolAnnotations
+
+    # Rewind the session's Application to the state captured after a
+    # specific history entry. Lets an agent explore "what if" branches
+    # without disconnecting and losing context. Implemented via our
+    # in-memory history rather than Burr's tracker-based replay so it
+    # works without requiring users to wire up a LocalTrackingClient.
+
+    async def fork_at(
+        sequence_id: int | None = None,
+        seq: int | None = None,
+        ctx: Context | None = None,
+    ) -> ToolResult | dict[str, Any]:
+        """Rewind the session to the state captured after history[seq=N].
+
+        ``sequence_id`` is the ``seq`` field on a ``authiro://history`` entry.
+        ``seq`` is accepted as an alias so a client can copy the value straight
+        from history under either name (``sequence_id`` wins if both are given).
+        The session's Application is rebuilt via the factory, then its
+        state is overwritten with the snapshot captured at that point,
+        and its ``__PRIOR_STEP`` is set to the action name from that
+        entry so ``valid_next_actions`` computes correctly. Sub-runs
+        recorded after that point are cleared. A ``fork_at`` marker is
+        appended to history with the target sequence_id under
+        ``inputs``.
+
+        Refuses when:
+          - shared-app mode (would affect every connected client);
+          - sequence_id is out of range;
+          - the target entry was a refusal (state_after is None);
+          - the target entry is itself a fork or reset marker (avoid
+            walking a hall of mirrors).
+        """
+        if factory is None:
+            return _step_tool_result(
+                {
+                    "error": "fork_not_supported",
+                    "reason": (
+                        "this server runs in shared-app mode (no factory was passed "
+                        "to mount); forking would affect every connected client. "
+                        "Remount with a factory to enable fork_at."
+                    ),
+                },
+                "fork_at × shared-app mode",
+            )
+        if ctx is None:
+            return _step_tool_result({"error": "no_session"}, "fork_at × no_session")
+        if sequence_id is None:
+            sequence_id = seq
+        if sequence_id is None:
+            return _step_tool_result(
+                {
+                    "error": "missing_sequence_id",
+                    "reason": (
+                        "pass sequence_id (the `seq` field from a "
+                        "authiro://history entry); `seq` is accepted as an alias."
+                    ),
+                },
+                "fork_at × missing_sequence_id",
+            )
+
+        entry = store.get_or_create(_session_key(ctx), factory)
+        async with entry.lock:
+            refusal = _fork_target_refusal(entry, sequence_id)
+            if refusal is not None:
+                return refusal
+            target = entry.history[sequence_id]
+            saved_state = target.get("state_after")
+            # _fork_target_refusal already refused entries without a snapshot.
+            assert saved_state is not None
+            target_action = target.get("action")
+
+            # Keep sub-runs spawned at or before the fork point; the
+            # parent history entries that reference them are still
+            # visible, so dropping them would leave dangling links.
+            kept_subrun_ids: set[str] = {
+                sid for h in entry.history[: sequence_id + 1] for sid in (h.get("subruns") or [])
+            }
+            kept_subruns = {
+                sid: rec for sid, rec in entry.subruns.items() if sid in kept_subrun_ids
+            }
+
+            new_app, new_state, valid_next = _restore_snapshot(
+                entry=entry,
+                factory=factory,
+                session_id=_session_key(ctx),
+                state_dict=saved_state,
+                last_action=target_action,
+                sequence_id_override=sequence_id,
+                kept_subruns=kept_subruns,
+            )
+
+        _record_history(
+            store,
+            ctx,
+            factory,
+            action="fork_at",
+            inputs={"sequence_id": sequence_id},
+            state_after=new_state,
+            valid_next_actions=valid_next,
+            app=new_app,
+        )
+
+        headline = f"Forked to seq={sequence_id} ({target_action})"
+        await _emit_log(ctx, headline)
+        return _step_tool_result(
+            {
+                "action": "fork_at",
+                "result": {
+                    "sequence_id": sequence_id,
+                    "from_action": target_action,
+                },
+                "state": new_state,
+                "valid_next_actions": valid_next,
+                "app_id": new_app.uid,
+                "tracker_project": _tracker_project(new_app),
+            },
+            headline,
+        )
+
+    mcp.tool(
+        name="fork_at",
+        description=fork_at.__doc__,
+        annotations=ToolAnnotations(
+            title="Branch this session from a prior step",
+            destructiveHint=True,  # replaces current state with the past snapshot
+            idempotentHint=False,
+            openWorldHint=False,
+        ),
+    )(fork_at)
+
+
+async def _load_past_state_via_loader(
+    state_loader: Any,
+    *,
+    partition_key: str,
+    app_id: str,
+    sequence_id: int,
+) -> tuple[dict[str, Any] | None, str | None, ToolResult | None]:
+    """Tier 1 of ``fork_from_past``: an explicit Burr ``BaseStateLoader``.
+
+    Works with any persister (SQLite, S3, postgres, etc.). Returns
+    ``(state_dict, last_action, None)`` on success or
+    ``(None, None, refusal)`` when the run can't be loaded.
+    """
+    try:
+        raw = state_loader.load(
+            partition_key=partition_key,
+            app_id=app_id,
+            sequence_id=sequence_id if sequence_id != -1 else None,
+        )
+        loaded = await raw if asyncio.iscoroutine(raw) else raw
+    except Exception as exc:
+        refusal = _step_tool_result(
+            {
+                "error": "unknown_past_run",
+                "reason": str(exc),
+                "app_id": app_id,
+                "sequence_id": sequence_id,
+            },
+            f"fork_from_past × unknown_past_run ({app_id})",
+        )
+        return None, None, refusal
+    if loaded is None:
+        refusal = _step_tool_result(
+            {
+                "error": "unknown_past_run",
+                "reason": "loader returned None",
+                "app_id": app_id,
+                "sequence_id": sequence_id,
+            },
+            f"fork_from_past × unknown_past_run ({app_id})",
+        )
+        return None, None, refusal
+    # PersistedStateData has state as a burr State; pull the dict out and
+    # let the rebuild path normalise.
+    return loaded["state"].get_all(), loaded.get("position"), None
+
+
+async def _load_past_state_via_tracker(
+    application: Application[Any] | None,
+    *,
+    partition_key: str,
+    app_id: str,
+    sequence_id: int,
+) -> tuple[dict[str, Any] | None, str | None, ToolResult | None]:
+    """Tier 2 of ``fork_from_past``: the Application's LocalTrackingClient.
+
+    The tracker is itself a Burr ``BaseStateLoader``, so load through the
+    supported ``.load()`` API (the same path as Tier 1), not the deprecated
+    ``LocalTrackingClient.load_state`` static.
+    """
+    try:
+        from burr.tracking.client import LocalTrackingClient
+    except ImportError:
+        return None, None, _step_tool_result({"error": "no_tracker"}, "fork_from_past × no_tracker")
+    tracker = getattr(application, "_tracker", None)
+    if not isinstance(tracker, LocalTrackingClient):
+        refusal = _step_tool_result(
+            {
+                "error": "no_tracker",
+                "reason": (
+                    "no state_loader passed to mount() and the current "
+                    "Application has no LocalTrackingClient. Either "
+                    "pass `state_loader=<BaseStateLoader>` to mount() "
+                    "or add `.with_tracker(LocalTrackingClient(...))` "
+                    "to the factory."
+                ),
+            },
+            "fork_from_past × no_tracker",
+        )
+        return None, None, refusal
+    return await _load_past_state_via_loader(
+        tracker, partition_key=partition_key, app_id=app_id, sequence_id=sequence_id
+    )
+
+
+def _register_fork_from_past_tool(
+    mcp: FastMCP,
+    *,
+    store: _SessionStore,
+    factory: ApplicationFactory | None,
+    state_loader: Any | None,
+) -> None:
+    """Register the ``fork_from_past`` meta tool on ``mcp``.
+
+    Resumes a past Burr run from disk: recovery after a server restart, or
+    forking from any persisted past app_id the client has tracked. Needs
+    factory mode (to rebuild the Application) and a state source (explicit
+    loader or the Application's LocalTrackingClient).
+    """
+    from mcp.types import ToolAnnotations
+
+    # Resume a past Burr run from disk. Lets an agent recover state
+    # after a server restart, or fork from any persisted past app_id
+    # the client has tracked. Requires:
+    #   - factory mode (need to rebuild the Application)
+    #   - the session's current Application to have a
+    #     LocalTrackingClient attached (so we know which storage_dir
+    #     and project to read from)
+
+    async def fork_from_past(
+        app_id: str,
+        sequence_id: int = -1,
+        partition_key: str = "",
+        ctx: Context | None = None,
+    ) -> ToolResult | dict[str, Any]:
+        """Resume a past Burr run by loading persisted state.
+
+        Three-tier source resolution:
+
+        1. If ``mount(state_loader=...)`` was passed an explicit Burr
+           ``BaseStateLoader``, use it. Any persister works:
+           ``SQLitePersister``, custom S3/postgres loaders, etc.
+        2. Else if the session's current Application has a
+           ``LocalTrackingClient`` attached, read its on-disk log.
+        3. Else refuse.
+
+        ``partition_key`` defaults to empty string, matching Burr's
+        default; pass it explicitly when your persister uses
+        partitioned storage.
+
+        Use this for:
+          - resuming a session across server restarts (track
+            ``app_id`` on the client, restore here after reconnect);
+          - forking from any persisted past run, not just the current
+            session's in-memory history.
+
+        Refuses when:
+          - shared-app mode (no factory to rebuild from);
+          - no state_loader configured and no LocalTrackingClient on
+            the Application;
+          - the requested app_id/sequence_id doesn't exist.
+        """
+        if factory is None:
+            return _step_tool_result(
+                {
+                    "error": "fork_not_supported",
+                    "reason": (
+                        "this server runs in shared-app mode (no factory was passed "
+                        "to mount); cross-session resume requires per-session "
+                        "isolation. Remount with a factory."
+                    ),
+                },
+                "fork_from_past × shared-app mode",
+            )
+        if ctx is None:
+            return _step_tool_result({"error": "no_session"}, "fork_from_past × no_session")
+
+        entry = store.get_or_create(_session_key(ctx), factory)
+        # Bind ``partition_key`` to the calling session's identity. Without
+        # this, a caller could pass any partition_key and load another
+        # tenant's persisted state. The bound partition_key is the one the
+        # session's factory wrote via ``with_identifiers(partition_key=...)``;
+        # when the caller passes the empty default we fill in that value, and
+        # when they pass a non-empty value that disagrees we refuse.
+        bound_partition_key = getattr(entry.application, "_partition_key", None) or ""
+        if partition_key and partition_key != bound_partition_key:
+            return _step_tool_result(
+                {
+                    "error": "partition_mismatch",
+                    "reason": (
+                        "the caller-supplied partition_key does not match the "
+                        "session's bound partition_key; refusing to load state "
+                        "from a different partition. Mount per-tenant servers "
+                        "if cross-partition resume is intended."
+                    ),
+                    "requested": partition_key,
+                },
+                f"fork_from_past × partition_mismatch ({partition_key})",
+            )
+        partition_key = bound_partition_key
+        async with entry.lock:
+            if state_loader is not None:
+                loaded_state_dict, last_action, refusal = await _load_past_state_via_loader(
+                    state_loader,
+                    partition_key=partition_key,
+                    app_id=app_id,
+                    sequence_id=sequence_id,
+                )
+            else:
+                loaded_state_dict, last_action, refusal = await _load_past_state_via_tracker(
+                    entry.application,
+                    partition_key=partition_key,
+                    app_id=app_id,
+                    sequence_id=sequence_id,
+                )
+            if refusal is not None:
+                return refusal
+            # The loader helpers return a refusal or a state, never neither.
+            assert loaded_state_dict is not None
+
+            # In-memory subruns belonged to the previous session state,
+            # which has been replaced; clear all of them.
+            new_app, new_state, valid_next = _restore_snapshot(
+                entry=entry,
+                factory=factory,
+                session_id=_session_key(ctx),
+                state_dict=loaded_state_dict,
+                last_action=last_action,
+            )
+
+        _record_history(
+            store,
+            ctx,
+            factory,
+            action="fork_from_past",
+            inputs={"app_id": app_id, "sequence_id": sequence_id},
+            state_after=new_state,
+            valid_next_actions=valid_next,
+            app=new_app,
+        )
+
+        headline = f"Resumed app_id={app_id} seq={sequence_id}"
+        await _emit_log(ctx, headline)
+        return _step_tool_result(
+            {
+                "action": "fork_from_past",
+                "result": {
+                    "loaded_app_id": app_id,
+                    "loaded_sequence_id": sequence_id,
+                    "from_action": last_action,
+                },
+                "state": new_state,
+                "valid_next_actions": valid_next,
+                "app_id": new_app.uid,
+                "tracker_project": _tracker_project(new_app),
+            },
+            headline,
+        )
+
+    mcp.tool(
+        name="fork_from_past",
+        description=fork_from_past.__doc__,
+        annotations=ToolAnnotations(
+            title="Resume a different session's past state",
+            destructiveHint=True,  # replaces this session's state with another's
+            idempotentHint=False,
+            openWorldHint=True,  # reaches outside the current session's history
+        ),
+    )(fork_from_past)
+
+
+def _wrap_with_hooks(
+    shared_app: Application[Any],
+    factory: ApplicationFactory | None,
+    hooks: list[Any],
+) -> ApplicationFactory | None:
+    """Attach user hooks to the shared app and wrap the factory to do the same.
+
+    Burr's adapter set is a plain list of LifecycleAdapter instances; we
+    append and re-derive the sync/async hook caches. Hooks attached this
+    way fire on the same surfaces as ``ApplicationBuilder.with_hooks(...)``;
+    they are not session-scoped, so place per-session logic inside the hook
+    body if needed.
+    """
+    wrapped = factory
+    if factory is not None:
+        original_factory = factory
+
+        def factory_with_hooks(session_id: str) -> Application[Any]:
+            app_inst = original_factory(session_id)
+            _attach_hooks(app_inst, hooks)
+            return app_inst
+
+        wrapped = factory_with_hooks
+    if shared_app is not None:
+        _attach_hooks(shared_app, hooks)
+    return wrapped
+
+
+def _resolve_upstream_manager(upstream: dict[str, Any] | None) -> Any:
+    """Accept an upstream config dict or a pre-built manager (shared mode).
+
+    A config dict is the common case; ``UpstreamManager`` opens real client
+    sessions for it. Anything with an async ``call`` attribute is treated
+    as a manager (test fakes, custom managers wrapping already-open
+    sessions).
+    """
+    if upstream is None:
+        return None
+    if hasattr(upstream, "call"):
+        return upstream
+    return UpstreamManager(upstream)
+
+
+def _resolve_upstream(upstream: Any) -> tuple[Any, Any]:
+    """Split an upstream config into ``(shared_manager, per_session_config)``.
+
+    A config dict that contains a ``{session}`` placeholder runs in per-session
+    isolation mode: no shared manager, and each session lazily builds its own
+    manager from the placeholder-substituted config (its own client /
+    subprocess / state file). Everything else (a plain dict, a pre-built
+    manager) runs in shared mode: one manager for all sessions.
+    """
+    from authiro.upstream import _config_is_per_session
+
+    if isinstance(upstream, dict) and _config_is_per_session(upstream):
+        return None, upstream
+    return _resolve_upstream_manager(upstream), None
+
+
+# COMPLEXITY: CC 14 from optional-feature wiring (hooks, personas, upstream,
+# middleware); each branch is a one-step toggle, and the registration bodies
+# live in the _register_* helpers above.
+def mount(
+    application: ApplicationOrFactory | Any,
+    *,
+    mode: ServingMode = ServingMode.STEP,
+    name: str | None = None,
+    instructions: str | None = None,
+    include_default_instructions: bool = True,
+    personas: PersonaSource | None = None,
+    default_persona: str | None = None,
+    session_ttl_seconds: int | None = _DEFAULT_SESSION_TTL_SECONDS,
+    max_sessions: int | None = _DEFAULT_MAX_SESSIONS,
+    action_timeout_seconds: float | None = None,
+    input_validators: dict[str, Callable[..., Any]] | None = None,
+    state_loader: Any | None = None,
+    next_hint: Callable[..., str | None] | None = None,
+    external_tools: dict[str, list[str]] | None = None,
+    upstream: dict[str, Any] | None = None,
+    hooks: list[Any] | None = None,
+    middleware: list[Any] | None = None,
+    session_app_id: Callable[[str], str] | None = None,
+) -> FastMCP:
+    """Return a FastMCP server that exposes ``application`` per ``mode``.
+
+    Args:
+        application: One of three forms. A built ``burr.core.Application``
+            (shared across all sessions). A callable ``() -> Application``
+            (called once per session for state isolation). Or a callable
+            ``() -> ApplicationBuilder`` (an unbuilt builder): Authiro
+            stamps ``app_id = session_id`` via ``with_identifiers`` and
+            builds it, binding Burr's tracking dir
+            (``storage_dir/project/<session_id>/``) to the session key so
+            the id never drifts on reset. Prefer the builder form when you
+            use Burr tracking; do not set your own ``app_id`` on it (use
+            ``partition_key`` for your own grouping). The graph shape is
+            read once at mount time, so factories should return the same
+            graph each call.
+        mode: ``ServingMode.STEP`` (the only supported value).
+        name: MCP server name; defaults to ``"authiro"``.
+        instructions: Server-level instructions surfaced via the MCP
+            spec's server-info ``instructions`` field. When
+            ``include_default_instructions`` is True (the default), the
+            machinery preamble (``DEFAULT_INSTRUCTIONS``) is prepended to
+            this string so the agent gets both how-to-drive-an-FSM guidance
+            and your FSM-specific guidance. Pass an empty string to suppress
+            the developer portion while still keeping the default preamble.
+        include_default_instructions: Whether to prepend
+            ``DEFAULT_INSTRUCTIONS`` (the validated 5-rule machinery preamble)
+            to the server's instructions. Default True. Floor-tested to lift
+            qwen3:0.6b from 0/10 to 10/10 on a trivial FSM, with no regression
+            on stronger models. Pass False if you want full control over what
+            the agent sees.
+        personas: An optional identity layer. Accepts a directory path (parses
+            every ``*.md`` file as a PERSONA.md), a single file path, a dict
+            ``{name: text}``, or a list of ``Persona`` objects. Each persona is
+            registered as an MCP prompt named ``authiro/persona/<name>`` so
+            clients can pick one at session-start, and the full set is
+            exposed at ``authiro://personas``. If unset, the server has no
+            identity layer (the historical Authiro behavior).
+        default_persona: The persona whose body is prepended to the server's
+            ``instructions`` for clients that don't pick one explicitly. Must
+            be one of the loaded persona names, or ``None`` (default) to use
+            the lexically first persona. Ignored if no personas are loaded.
+        session_ttl_seconds: Idle TTL for the per-session store. After
+            this many seconds without a tool call or resource read, a
+            session's Application and history are evicted on the next
+            access. Set to ``None`` to disable TTL eviction. Default
+            3600 (1 hour).
+        max_sessions: Hard cap on simultaneous live sessions in the
+            store. When exceeded, the least-recently-accessed entry
+            is evicted on insert. Set to ``None`` to disable size
+            eviction. Default 100.
+        action_timeout_seconds: Server-wide timeout applied to every
+            action invocation. Wraps ``app.astep`` in
+            ``asyncio.wait_for``; on expiry the action's coroutine is
+            cancelled and the call returns an ``action_timeout`` error
+            without advancing state. ``None`` (default) means no
+            timeout. Cancellation is prompt for async actions doing
+            I/O; for sync or CPU-bound work it's best-effort.
+        input_validators: Optional mapping of action name to a
+            validator callable ``(state_dict, inputs) -> dict | None``.
+            Runs before action dispatch. May raise ``ValidationFailed``
+            to refuse the call, return a dict to substitute normalised
+            inputs, or return None to accept the originals. Async
+            validators are supported. ToolSpec-declared validators
+            from the importer also work; per-action attribute
+            ``fn._authiro_validator`` is the hand-tagged escape hatch.
+        state_loader: Optional Burr ``BaseStateLoader`` (SQLite, S3,
+            Postgres, etc.) used by ``fork_from_past``. Resolution order:
+            this loader wins; else the current Application's
+            ``LocalTrackingClient``; else refuse.
+        next_hint: Optional callback for domain-specific reactive
+            guidance. Receives ``(state, valid_next_actions, last_action,
+            refusal=None)`` and returns a single-line natural-language
+            hint, or ``None`` to defer to the structural auto-hint.
+            Called after every step success and every refusal. The
+            returned string (or the auto-hint when this returns None)
+            is appended to the step response as ``next_hint``. Closes
+            the gap weaker agent models hit when enumeration of valid
+            actions isn't enough -- they need direction, not just a list.
+            Backwards-compatible: three-arg callbacks (without the
+            ``refusal`` parameter) still work.
+        external_tools: Experimental, advisory. Prefer ``upstream`` for
+            driving other MCP servers. This is the fallback for the case
+            where Authiro cannot be in the call path (the agent reaches a
+            server Authiro can't, e.g. a separate auth or network
+            boundary). Maps an action name to tool names on OTHER MCP
+            servers the agent is connected to. Surfaced per-action in
+            ``authiro://graph`` and contextually as ``next_external_tools``
+            in each ``step`` response, as advisory guidance only: the
+            agent calls those tools on its own connected servers, then
+            ``step()``s. Authiro neither executes nor validates them.
+            Being a two-surface design, it relies on the model's
+            discipline and works best with capable models. Unknown action
+            names are ignored with a warning at mount time.
+        upstream: Optional mapping of server name to a ``fastmcp.Client``
+            transport spec (a URL string, an mcp-config dict, or a
+            transport object). authiro opens an MCP *client* session to
+            each and binds them so action bodies can call their tools via
+            ``authiro.call_upstream(server, tool, args)``. Unlike
+            ``external_tools`` (advisory; the agent calls tools on its own
+            connected servers), ``upstream`` puts authiro in the call path:
+            the agent sees only authiro's ``step`` tool, the upstream
+            servers are not exposed to it, and every upstream call happens
+            inside an action so it advances state by construction. This is
+            the single-surface, ledger-honest way to drive any MCP server
+            from a graph, and it works with any compliant server because
+            ``fastmcp.Client`` speaks every transport. Sessions open
+            lazily on first use and stay open for the server's lifetime.
+
+            Per-session isolation: by default one upstream client/subprocess
+            is shared across all MCP sessions, which is correct and cheaper
+            for stateless upstreams (filesystem reads, fetch). For a *stateful*
+            upstream (a memory server, a per-tenant database), put a
+            ``{session}`` placeholder anywhere in that server's config and each
+            session gets its own client built from the substituted config, so
+            their state never collides. For example
+            ``{"env": {"MEMORY_FILE_PATH": "/data/{session}.json"}}`` gives
+            every session a private memory file. Per-session clients are closed
+            when their session is evicted.
+        hooks: Optional list of Burr ``LifecycleAdapter`` instances
+            (``PreRunStepHook``, ``PostRunStepHook``, ``PreStartStreamHook``,
+            ``DoLogAttributeHook``, etc.). Attached to every session's
+            Application after construction. Equivalent to calling
+            ``ApplicationBuilder.with_hooks(...)`` inside the factory, but
+            keeps adapter-side concerns (timing, custom telemetry sinks,
+            structured logging) out of the factory.
+        middleware: Optional list of FastMCP ``Middleware`` instances added
+            to the mounted server after Authiro's built-in input-coercion
+            middleware. Useful for OTel spans on every MCP call, rate
+            limiting, structured logging, or per-call metrics; the
+            ``with_middleware`` example demo uses this pattern with
+            ``TimingMiddleware`` / ``StructuredLoggingMiddleware`` /
+            ``RateLimitingMiddleware``. Order matters: middleware added
+            earlier wraps later ones, so these run inside the coercion
+            layer (they see post-coercion args).
+        session_app_id: Optional ``(session_id) -> str`` hook that maps the
+            FastMCP session id to the Burr ``app_id`` for builder factories.
+            Use it for a human-readable, name-sortable tracking id such as a
+            UTC timestamp (``20260627T171435-841aac``) instead of the bare
+            session id. The result becomes the tracking dir name, so it must be
+            filesystem-safe and unique per session (incorporate the session id
+            or a timestamp). Default keeps ``app_id = session_id``. Ignored for
+            a factory that returns a built ``Application`` (its id is frozen).
+    """
+    from authiro.assembly import Assembly
+
+    if isinstance(application, Assembly):
+        return _mount_from_assembly(
+            application,
+            mode=mode,
+            name=name,
+            instructions=instructions,
+            include_default_instructions=include_default_instructions,
+            personas=personas,
+            default_persona=default_persona,
+            session_ttl_seconds=session_ttl_seconds,
+            max_sessions=max_sessions,
+            action_timeout_seconds=action_timeout_seconds,
+            input_validators=input_validators,
+            state_loader=state_loader,
+            next_hint=next_hint,
+            external_tools=external_tools,
+            upstream=upstream,
+            hooks=hooks,
+            middleware=middleware,
+        )
+
+    _silence_fastmcp_loggers()
+    shared_app, factory, sessions_tracked = _resolve(application, session_app_id)
+    if factory is None:
+        _warn_shared_app_mode()
+
+    # When user-supplied hooks are provided, wrap shared_app or factory so
+    # the hooks are attached after construction.
+    if hooks:
+        factory = _wrap_with_hooks(shared_app, factory, hooks)
+    # Per-session store keyed by _session_key(ctx); populated lazily on
+    # the first tool call. Lives in closure scope so it's tied to this
+    # server instance, not module-global. Holds both the session's
+    # Application (factory mode only) and its history (always).
+    store = _SessionStore(
+        ttl_seconds=session_ttl_seconds,
+        max_sessions=max_sessions,
+    )
+    # Lock used in shared-app mode (one Application, many sessions).
+    # In factory mode each session uses its own ``entry.lock`` instead.
+    shared_lock = asyncio.Lock()
+
+    server_name = name or "authiro"
+    # Normalize the external-tools map: keep only entries whose action
+    # name exists in the graph; warn (don't fail) on unknowns so a typo
+    # doesn't take the server down.
+    external_tools_map = _normalize_external_tools(external_tools, shared_app)
+    upstream_manager, upstream_per_session_config = _resolve_upstream(upstream)
+    # Static graph summary, computed once. Sub-runs may have their own
+    # graphs but this resource describes the top-level one.
+    graph_summary = _compute_graph_summary(shared_app, server_name, external_tools_map)
+    graph_summary_json = json.dumps(graph_summary, indent=2)
+    # Augment user-supplied instructions with a one-line hint pointing
+    # at authiro://graph. Cold-start discoverability without forcing users
+    # to write the hint themselves.
+    action_surface = _render_action_surface(shared_app)
+    discovery_hint = (
+        "Each step response includes the new state and valid_next_actions "
+        "inline — no need to poll authiro://next or authiro://state. "
+        "To restart the FSM after reaching a terminal node or a dead-end "
+        "branch, call reset_session. To rewind to a specific earlier point "
+        "and explore an alternate path, call fork_at(sequence_id) with a "
+        "seq from authiro://history. Both are always available."
+    )
+    # Load personas (the identity layer). One persona becomes the default for
+    # this server's instructions; all personas are registered as MCP prompts
+    # so clients can pick a different one at session-start.
+    from authiro.persona import load_personas, resolve_default
+
+    personas_map = load_personas(personas)
+    persona = resolve_default(personas_map, default_persona)
+    persona_prompt = persona.to_prompt_text() if persona is not None else None
+
+    # Compose the server's instructions in this order:
+    #   1. DEFAULT_INSTRUCTIONS: the machinery preamble (how to drive an FSM)
+    #   2. default persona prompt: who's executing the workflow (identity)
+    #   3. instructions: developer-supplied (what this specific FSM is for)
+    #   4. action_surface: the rendered action listing
+    #   5. discovery_hint: pointer to ``authiro://graph`` etc.
+    # Order matters: machinery first (protocol), identity next (voice/role),
+    # then domain instructions, then the listings. The agent reads top-down.
+    preamble = DEFAULT_INSTRUCTIONS if include_default_instructions else None
+    parts = [
+        p for p in (preamble, persona_prompt, instructions, action_surface, discovery_hint) if p
+    ]
+    effective_instructions = "\n\n".join(parts)
+    # ``strict_input_validation=False`` lets the coercion middleware below
+    # run before FastMCP rejects out-of-shape arguments. With strict
+    # validation on, the MCP SDK validates JSON-RPC params against the
+    # tool's input schema before middleware ever sees them, so a client
+    # that sends ``inputs: "{\"item\":\"mocha\"}"`` (string) instead of
+    # ``inputs: {"item":"mocha"}`` (object) gets rejected at the SDK
+    # layer. Off plus the coercion middleware means the middleware
+    # parses the string back to a dict, and Burr's own action-input
+    # checking then validates at the action layer.
+    mcp = FastMCP(
+        server_name,
+        instructions=effective_instructions,
+        strict_input_validation=False,
+    )
+    # Tolerate clients that JSON-encode object-typed arguments as strings
+    # (e.g. IBM Bob as of mid-2026). The middleware re-parses such strings
+    # to objects/arrays when the tool's declared schema says the param
+    # should be one. Tools whose schemas say "string" are not touched.
+    mcp.add_middleware(_build_coercion_middleware())
+    # User-supplied middleware runs AFTER the built-in coercion middleware,
+    # so by the time a user's TimingMiddleware / StructuredLoggingMiddleware /
+    # RateLimitingMiddleware sees a tools/call, JSON-string args have already
+    # been re-parsed. Add order matters for FastMCP middleware; this places
+    # user code closer to the tool body.
+    for _mw in middleware or ():
+        mcp.add_middleware(_mw)
+
+    _register_resources(
+        mcp,
+        store=store,
+        shared_app=shared_app,
+        shared_lock=shared_lock,
+        factory=factory,
+        graph_summary_json=graph_summary_json,
+        graph_summary=graph_summary,
+        upstream_manager=upstream_manager,
+        upstream_per_session_config=upstream_per_session_config,
+    )
+    _register_personas(
+        mcp, personas_map=personas_map, persona=persona, store=store, factory=factory
+    )
+
+    if mode is not ServingMode.STEP:
+        raise ValueError(f"unknown serving mode: {mode!r}")
+    _register_step_tool(
+        mcp,
+        store=store,
+        shared_app=shared_app,
+        shared_lock=shared_lock,
+        factory=factory,
+        action_timeout_seconds=action_timeout_seconds,
+        input_validators=input_validators,
+        upstream_manager=upstream_manager,
+        upstream_per_session_config=upstream_per_session_config,
+        external_tools_map=external_tools_map,
+        next_hint=next_hint,
+        action_surface=action_surface,
+    )
+    _register_reset_tool(mcp, store=store, factory=factory)
+    _register_fork_at_tool(mcp, store=store, factory=factory)
+    _register_fork_from_past_tool(mcp, store=store, factory=factory, state_loader=state_loader)
+
+    # Surfaces resources as tools for clients without resources/read
+    # (IBM Bob Shell, as of mid-2026).
+    from fastmcp.server.transforms import ResourcesAsTools, Visibility
+
+    mcp.add_transform(ResourcesAsTools(mcp))
+
+    # Without a tracker or loader, fork_from_past can only refuse.
+    # ``sessions_tracked`` (not the tracker-suppressed template) reports
+    # whether real sessions carry a LocalTrackingClient.
+    if state_loader is None and not sessions_tracked:
+        mcp.add_transform(Visibility(False, names={"fork_from_past"}))
+
+    return mcp
+
+
+_NAMESPACE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
+
+
+def mount_multi(
+    applications: dict[str, ApplicationOrFactory],
+    *,
+    mode: ServingMode = ServingMode.STEP,
+    name: str | None = None,
+    instructions: str | None = None,
+    session_ttl_seconds: int | None = _DEFAULT_SESSION_TTL_SECONDS,
+    max_sessions: int | None = _DEFAULT_MAX_SESSIONS,
+    action_timeout_seconds: float | None = None,
+    hooks: list[Any] | None = None,
+    middleware: list[Any] | None = None,
+) -> FastMCP:
+    """Mount multiple Burr Applications as one MCP server.
+
+    Each application is wrapped by ``mount()`` independently, then
+    composed into a parent FastMCP via FastMCP's native server-
+    composition (``parent.mount(sub, namespace=...)``). Namespacing
+    rules follow FastMCP:
+
+    * Tools are renamed ``<app>_<tool>``. In STEP mode this means each
+      app exposes ``<app>_step``, ``<app>_reset_session``,
+      ``<app>_fork_at``, ``<app>_fork_from_past``.
+    * Resources keep their scheme but get the namespace inserted:
+      ``authiro://graph`` from app ``order`` becomes ``authiro://order/graph``.
+
+    Args:
+        applications: Mapping of namespace name to Application or
+            factory. Names must be valid Python identifiers
+            (alphanumeric + underscore, starting with a letter) so the
+            FastMCP namespacing rule produces clean tool / resource
+            names.
+        mode: Serving mode applied to every sub-application.
+        name: Parent server name surfaced to MCP clients.
+        instructions: Server-level instructions for the parent. The
+            per-app instructions (with the auto-described action
+            surface) remain on each sub-server.
+        session_ttl_seconds: Forwarded to each sub-application's
+            ``mount()`` call.
+        max_sessions: Forwarded to each sub-application's ``mount()`` call.
+        action_timeout_seconds: Forwarded to each sub-application's
+            ``mount()`` call.
+        hooks: Burr ``LifecycleAdapter`` instances forwarded to each
+            sub-application's ``mount()`` call. Attached to every
+            sub-application's sessions; if you need per-app hooks, mount
+            them separately and compose manually.
+        middleware: FastMCP ``Middleware`` instances forwarded to each
+            sub-application's ``mount()`` call. Each sub-server's middleware
+            sees the post-routing tool name (``step``, not ``<app>_step``)
+            because FastMCP composition strips the namespace before
+            dispatching to the sub-server. The parent server is not
+            middleware-wrapped here; add middleware to the returned FastMCP
+            with ``server.add_middleware(...)`` if you want a single
+            wrapper around all sub-servers.
+
+    A ``authiro://apps`` resource on the parent lists the mounted app
+    names so a connecting agent can discover the namespace surface in
+    one read.
+    """
+    if not applications:
+        raise ValueError("mount_multi requires at least one application")
+    invalid = [n for n in applications if not _NAMESPACE_RE.match(n)]
+    if invalid:
+        raise ValueError(
+            f"namespace names must match {_NAMESPACE_RE.pattern!r}; got invalid: {invalid}"
+        )
+
+    parent_name = name or "authiro-multi"
+    parent_lines: list[str] = []
+    if instructions:
+        parent_lines.append(instructions)
+    parent_lines.append(
+        "Multi-Application server. The following Burr Applications are "
+        "mounted side by side, namespaced by app name:"
+    )
+    parent_lines.extend(f"  - {app_name}" for app_name in sorted(applications))
+    parent_lines.append(
+        "Tools are renamed <app>_<tool>; resources are accessible as "
+        "authiro://<app>/<path>. Read `authiro://apps` for the live list."
+    )
+    parent_instructions = "\n\n".join(parent_lines)
+
+    parent = FastMCP(parent_name, instructions=parent_instructions)
+
+    for app_name, app_or_factory in applications.items():
+        sub = mount(
+            app_or_factory,
+            mode=mode,
+            name=app_name,
+            session_ttl_seconds=session_ttl_seconds,
+            max_sessions=max_sessions,
+            action_timeout_seconds=action_timeout_seconds,
+            hooks=hooks,
+            middleware=middleware,
+        )
+        parent.mount(sub, namespace=app_name)
+
+    namespace_list = sorted(applications)
+
+    @parent.resource("authiro://apps")
+    async def _apps_resource() -> str:
+        """List the apps mounted on this multi-Application server."""
+        return json.dumps({"apps": namespace_list}, indent=2)
+
+    return parent

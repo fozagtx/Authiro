@@ -1,0 +1,484 @@
+"""``authiro serve``, ``doctor``, ``ui``, plus the ``build_cli`` factory and ``main``."""
+
+from __future__ import annotations
+
+import contextlib
+import os
+import sys
+from pathlib import Path
+from typing import Annotated, Any
+
+import click
+import typer
+
+from authiro.adapter import ServingMode, mount
+from authiro.cli._branding import (
+    _BRANDING,
+    _DEFAULT_HELP,
+    _Branding,
+    _set_branding,
+    console,
+    err_console,
+)
+from authiro.cli._resolve import _resolve_serve_target
+from authiro.cli._topology import render
+from authiro.cli.reports import report
+from authiro.cli.sessions import (
+    logs,
+    sessions_diff,
+    sessions_ls,
+    sessions_show,
+    sessions_tail,
+    watch,
+)
+from authiro.cli.status import status, verify
+from authiro.primer import primer
+
+# Typer >= 0.26 vendors its own copy of click under ``typer._click``, whose
+# ClickException is a different class from the top-level ``click`` one, so
+# catching only ``click.ClickException`` lets usage errors escape as raw
+# tracebacks on a fresh install. Catch both bases across the supported typer
+# range (``typer._click`` is absent before 0.26).
+_CLICK_EXCEPTIONS: tuple[type[Exception], ...] = (click.ClickException,)
+with contextlib.suppress(ImportError):
+    from typer._click.exceptions import ClickException as _VendoredClickException
+
+    _CLICK_EXCEPTIONS = (*_CLICK_EXCEPTIONS, _VendoredClickException)
+
+
+def _server_from_target(application_or_factory: Any, *, mode: ServingMode, name: str) -> Any:
+    """Resolve a serve target to a runnable FastMCP.
+
+    An Application or a factory (``() -> Application`` / builder) is mounted.
+    An already-mounted ``FastMCP`` — or a ``build_server()`` callable returning
+    one — is run as-is; that is how an FSM that owns a mount-level ``upstream``
+    is served (it configured itself, so ``name``/``mode``/brand upstream don't
+    apply).
+    """
+    from fastmcp import FastMCP
+
+    if isinstance(application_or_factory, FastMCP):
+        return application_or_factory
+    try:
+        return mount(application_or_factory, mode=mode, name=name, upstream=_BRANDING.upstream)
+    except TypeError as exc:
+        # mount() expected an Application/builder; a callable returning a
+        # FastMCP (the build_server pattern) is run directly instead.
+        if callable(application_or_factory) and "FastMCP" in str(exc):
+            return application_or_factory()
+        raise
+
+
+def serve(
+    target: Annotated[
+        str | None,
+        typer.Argument(
+            help=(
+                "Import target in module:attr form. The attr is either a "
+                "burr.core.Application or a callable returning one. Optional "
+                "when a graph is baked in via build_cli(application=...)."
+            ),
+        ),
+    ] = None,
+    mode: Annotated[
+        ServingMode,
+        typer.Option("--mode", help="Serving mode.", case_sensitive=False),
+    ] = ServingMode.STEP,
+    name: Annotated[
+        str | None,
+        typer.Option(
+            "--name",
+            help="MCP server name surfaced to clients (default: derived from target).",
+        ),
+    ] = None,
+    app_dir: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--app-dir",
+            help=(
+                "Extra directory to prepend to sys.path before importing. "
+                "Repeatable. Use when the FSM module is in a subdirectory."
+            ),
+        ),
+    ] = None,
+    gate_config: Annotated[
+        str | None,
+        typer.Option(
+            "--config",
+            "-c",
+            help=(
+                "Proxy mode: gate YAML naming upstreams, rules, and the "
+                "approver public key. Mounts the upstream MCP servers behind "
+                "the gate instead of serving an Application."
+            ),
+        ),
+    ] = None,
+    transport: Annotated[
+        str,
+        typer.Option(
+            "--transport",
+            help="Transport: stdio (default), http, sse, or streamable-http.",
+            case_sensitive=False,
+        ),
+    ] = "stdio",
+    host: Annotated[
+        str,
+        typer.Option("--host", help="Bind address for http/sse transports."),
+    ] = "127.0.0.1",
+    port: Annotated[
+        int,
+        typer.Option("--port", help="Port for http/sse transports."),
+    ] = 8000,
+) -> None:
+    """Launch an importable Burr Application or factory as an MCP server.
+
+    The target attr is usually a ``burr.core.Application`` or a callable
+    returning one (factory / builder seam). It may also be an already-mounted
+    ``FastMCP`` — or a ``build_server()`` callable returning one — which is the
+    way to serve an FSM that owns a mount-level ``upstream`` config; in that
+    case the pre-mounted server is run as-is (``--name`` / ``--mode`` / brand
+    upstream don't apply, since it configured itself).
+
+    With ``-c <gate.yaml>`` the server is a **proxy gate**: the upstream MCP
+    servers named in the YAML are mounted behind one namespaced surface
+    (``cloud_delete_volume``, ...), every call is classified and rule-checked,
+    destructive calls wait for a signed human approval, and every decision is
+    ledgered.
+    """
+    if gate_config is not None:
+        from authiro.config import load_config
+        from authiro.proxy import mount_proxy
+
+        config = load_config(gate_config)
+        server = mount_proxy(config.upstreams or None, config=config)
+    else:
+        application_or_factory, derived_name = _resolve_serve_target(target, app_dir or [])
+        server = _server_from_target(application_or_factory, mode=mode, name=name or derived_name)
+    transport_norm = transport.lower()
+    # FastMCP serves at a path tail, so a client connecting to the bare
+    # host:port gets a 404. Echo the full URL.
+    if transport_norm in ("http", "sse", "streamable-http"):
+        path = "/sse" if transport_norm == "sse" else "/mcp"
+        typer.echo(f"MCP endpoint: http://{host}:{port}{path}", err=True)
+    # AUTHIRO_QUIET suppresses FastMCP's startup banner, which otherwise
+    # prints to stderr and clutters an embedding agent's console.
+    banner = not os.environ.get("AUTHIRO_QUIET")
+    if transport_norm == "stdio":
+        server.run(transport="stdio", show_banner=banner)
+    elif transport_norm == "http":
+        server.run(transport="http", host=host, port=port, show_banner=banner)
+    elif transport_norm == "sse":
+        server.run(transport="sse", host=host, port=port, show_banner=banner)
+    elif transport_norm == "streamable-http":
+        server.run(transport="streamable-http", host=host, port=port, show_banner=banner)
+    else:
+        raise typer.BadParameter(
+            f"unknown transport {transport!r}; expected stdio, http, sse, or streamable-http"
+        )
+
+
+def doctor(
+    target: Annotated[
+        str | None,
+        typer.Argument(help="Import target in module:attr form. Same shape as `serve`."),
+    ] = None,
+    app_dir: Annotated[
+        list[str] | None,
+        typer.Option("--app-dir", help="Extra sys.path directory before importing."),
+    ] = None,
+    verbose: Annotated[
+        bool,
+        typer.Option("--verbose", help="Print every check, not just failures and warnings."),
+    ] = False,
+    runtime: Annotated[
+        bool,
+        typer.Option(
+            "--runtime",
+            help=(
+                "Also mount the server in-process and probe its wire shape: "
+                "tool listing, resource catalog, step result content blocks."
+            ),
+        ),
+    ] = False,
+) -> None:
+    """Statically validate a Burr Application or factory before mounting."""
+    from authiro.doctor import format_report, run_checks
+
+    application_or_factory, _ = _resolve_serve_target(target, app_dir or [])
+    report_obj = run_checks(application_or_factory, runtime=runtime)
+    typer.echo(format_report(report_obj, verbose=verbose))
+    if not report_obj.ok:
+        raise typer.Exit(code=1)
+
+
+def ui(
+    port: Annotated[int, typer.Option("--port", help="Port for the UI server.")] = 7241,
+    host: Annotated[
+        str,
+        typer.Option("--host", help="Bind address. Use 0.0.0.0 to expose on the network."),
+    ] = "127.0.0.1",
+    home: Annotated[
+        Path | None,
+        typer.Option("--home", help="Tracker storage root to read sessions from."),
+    ] = None,
+    vanilla: Annotated[
+        bool,
+        typer.Option("--vanilla", help="Launch Burr's unthemed UI instead of the branded console."),
+    ] = False,
+    no_open: Annotated[
+        bool, typer.Option("--no-open", help="Don't open a browser tab when the UI starts.")
+    ] = False,
+) -> None:
+    """Launch the session console: a branded, sidebar-free view of tracked sessions.
+
+    Reads from the resolved storage root (``--home``, the configured home, or
+    the default). A rebranded CLI shows its own name; pass ``--vanilla`` for
+    Burr's stock UI (bootstrapped via uvx if needed).
+    """
+    from authiro.cli._resolve import _resolve_home
+
+    storage_dir = _resolve_home(home)
+
+    if vanilla:
+        _launch_vanilla_ui(host=host, port=port, no_open=no_open, storage_dir=storage_dir)
+        return
+
+    from authiro._ui import brand_identity, serve_themed
+    from authiro.cli._branding import _prog_slug
+    from authiro.tokens import brand_tokens
+
+    name, mark, credit = brand_identity(
+        _BRANDING.prog_name, ui_title=_BRANDING.ui_title, ui_mark=_BRANDING.ui_mark
+    )
+    tokens = brand_tokens(_prog_slug(_BRANDING.prog_name))
+
+    console.print(
+        f"Launching {name} session console on [link]http://{host}:{port}[/link]  "
+        f"[muted](reading {storage_dir})[/]"
+    )
+    try:
+        serve_themed(
+            host=host,
+            port=port,
+            storage_dir=storage_dir,
+            name=name,
+            mark=mark,
+            subtitle="session tracking",
+            credit_html=credit,
+            open_browser=not no_open,
+            tokens=tokens,
+        )
+    except ImportError as exc:
+        err_console.print(
+            f"the session console needs the UI extra: try "
+            f"[bold]uv pip install '{_BRANDING.ui_extra}'[/], or run with "
+            "[bold]--vanilla[/] to bootstrap Burr's UI via uvx."
+        )
+        raise typer.Exit(code=1) from exc
+    except KeyboardInterrupt:
+        pass
+
+
+def _launch_vanilla_ui(*, host: str, port: int, no_open: bool, storage_dir: Path) -> None:
+    r"""Burr's stock UI, scoped to ``storage_dir`` via the ``burr_path`` env var.
+
+    Prefers a local apache-burr\\[start] (one process); otherwise shells out to
+    ``uvx --from 'apache-burr\\[start]'``.
+    """
+    import shutil
+    import subprocess
+
+    forwarded = ["--port", str(port), "--host", host]
+    if no_open:
+        forwarded.append("--no-open")
+    env = {**os.environ, "burr_path": str(storage_dir)}
+
+    try:
+        import loguru  # noqa: F401 (probe-only)
+
+        cmd = [
+            sys.executable,
+            "-c",
+            "from burr.cli.__main__ import cli_run_server; cli_run_server()",
+            *forwarded,
+        ]
+    except ImportError:
+        if shutil.which("uvx") is None:
+            err_console.print(
+                "the Burr UI needs either apache-burr[start] installed in the "
+                f"current env (try [bold]uv pip install '{_BRANDING.ui_extra}'[/]) or "
+                "[bold]uvx[/] on PATH (https://docs.astral.sh/uv/) for one-shot bootstrap."
+            )
+            raise typer.Exit(code=1) from None
+        cmd = ["uvx", "--from", "apache-burr[start]", "burr", *forwarded]
+
+    console.print(f"Launching Burr UI on [link]http://{host}:{port}[/link]")
+    try:
+        subprocess.run(cmd, check=True, env=env)
+    except subprocess.CalledProcessError as exc:
+        raise typer.Exit(code=exc.returncode or 1) from exc
+    except KeyboardInterrupt:
+        pass
+
+
+def _version_callback(value: bool) -> None:
+    if not value:
+        return
+    from authiro.cli.status import _authiro_installed_version
+
+    console.print(f"{_BRANDING.prog_name} {_authiro_installed_version()}")
+    raise typer.Exit()
+
+
+def build_cli(
+    prog_name: str = "authiro",
+    *,
+    application: Any | None = None,
+    help: str | None = None,
+    server_name: str | None = None,
+    ui_extra: str = "authiro[ui]",
+    home: str | Path | None = None,
+    upstream: dict[str, Any] | None = None,
+    ui_mark: str | None = None,
+    ui_title: str | None = None,
+) -> typer.Typer:
+    """Build a authiro CLI, optionally rebranded for a downstream package.
+
+    A package that ships its own MCP graph can expose its own command::
+
+        # my_fsm_mcp/cli.py
+        from authiro.cli import build_cli, run
+        from my_fsm_mcp import build_application
+
+        cli = build_cli("my-fsm-mcp", application=build_application,
+                        help="My graph as an MCP server.")
+
+        def main() -> int:
+            return run(cli)
+
+    Then ``my-fsm-mcp serve`` (no target needed), ``my-fsm-mcp doctor``, and
+    ``my-fsm-mcp sessions ls`` all carry the downstream's name. Sessions are
+    still stored in Burr's tracker format; set ``home`` to match the
+    ``storage_dir`` the downstream's ``LocalTrackingClient`` writes to.
+
+    Args:
+        prog_name: command name shown in help and used as the default
+            server name when a baked-in Application has no other name.
+        application: an ``Application``, a factory, or a ``module:attr``
+            string. When set, ``serve``/``doctor`` accept no target.
+        help: root help text. Defaults to the authiro description.
+        server_name: default MCP server name surfaced to clients.
+        ui_extra: pip extra named in the ``ui`` install hint.
+        home: default tracker storage root for the observability
+            commands. Overridden per-invocation by ``--home``. When
+            omitted, storage auto-derives to ``~/.{prog_name}`` (e.g.
+            ``~/.helios`` for ``prog_name="helios"``), so no explicit
+            ``home=`` is needed for a typical rebrand.
+        upstream: map of server name to a ``fastmcp.Client`` transport.
+            Action bodies reach these other MCP servers with
+            ``call_upstream(server, tool, args)``. Passed through to
+            ``mount`` by ``serve``.
+        ui_mark: glyph shown before the name in the ``ui`` session console's
+            brand bar. Defaults to none for a rebrand (Authiro's own CLI
+            shows ``⊢``).
+        ui_title: display name in the brand bar. Defaults to ``prog_name``
+            with its first letter capitalized.
+    """
+    _set_branding(
+        _Branding(
+            prog_name=prog_name,
+            application=application,
+            server_name=server_name,
+            ui_extra=ui_extra,
+            home=home,
+            upstream=upstream,
+            ui_mark=ui_mark,
+            ui_title=ui_title,
+        )
+    )
+
+    cli = typer.Typer(
+        name=prog_name,
+        help=help or _DEFAULT_HELP,
+        no_args_is_help=True,
+        add_completion=False,
+        pretty_exceptions_enable=False,
+    )
+    sessions = typer.Typer(
+        name="sessions",
+        help="Inspect Burr tracker storage: list, show, or live-tail a session.",
+        pretty_exceptions_enable=False,
+        no_args_is_help=True,
+    )
+    sessions.command("ls")(sessions_ls)
+    sessions.command("list", hidden=True)(sessions_ls)  # muscle-memory alias
+    sessions.command("show")(sessions_show)
+    sessions.command("tail")(sessions_tail)
+    sessions.command("diff")(sessions_diff)
+    cli.add_typer(sessions, name="sessions")
+
+    cli.command()(serve)
+    cli.command()(doctor)
+    cli.command()(render)
+    cli.command()(ui)
+    cli.command()(watch)
+    cli.command()(logs)
+    cli.command()(verify)
+    cli.command()(status)
+    cli.command()(report)
+    # Gate commands (proxy mode): the human side of the gate.
+    from authiro.cli import gate as _gate
+
+    cli.command(name="keygen")(_gate.keygen)
+    cli.command(name="check")(_gate.check)
+    cli.command(name="pending")(_gate.pending)
+    cli.command(name="approve")(_gate.approve)
+    cli.command(name="deny")(_gate.deny)
+    cli.command(name="freeze")(_gate.freeze)
+    cli.command(name="receipt")(_gate.receipt)
+    # ``primer`` is a Authiro-specific demo of Authiro's onboarding and
+    # ships labels and URLs that name the project explicitly. Don't register
+    # it for rebranded CLIs ( ``build_cli(prog_name="my-fsm")`` ) since the
+    # downstream surface would otherwise advertise authiro.
+    if prog_name == "authiro":
+        cli.command()(primer)
+
+    @cli.callback()
+    def _root(
+        version: bool = typer.Option(
+            False,
+            "--version",
+            callback=_version_callback,
+            is_eager=True,
+            help="Show version and exit.",
+        ),
+    ) -> None:
+        pass
+
+    return cli
+
+
+def run(cli: typer.Typer, argv: list[str] | None = None) -> int:
+    """Run a Typer app with graceful exit-code handling. ``argv`` is for tests."""
+    try:
+        rv = cli(args=argv, standalone_mode=False)
+        return rv if isinstance(rv, int) else 0
+    except typer.Exit as e:
+        return e.exit_code or 0
+    except _CLICK_EXCEPTIONS as e:
+        # standalone_mode=False makes Click raise usage errors (unknown option,
+        # bad parameter, missing argument) instead of printing them, so without
+        # this they'd surface as a raw traceback. Render them the way Click
+        # normally would: a clean "Error: ..." line and Click's exit code (2).
+        # ``e`` is a Click-style exception (top-level or typer-vendored); both
+        # carry ``show()`` and ``exit_code`` but share no common static type.
+        exc: Any = e
+        exc.show()
+        return int(exc.exit_code)
+    except SystemExit as e:
+        if e.code is None:
+            return 0
+        if isinstance(e.code, int):
+            return e.code
+        err_console.print(str(e.code))
+        return 1

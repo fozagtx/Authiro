@@ -1,0 +1,674 @@
+"""Static validation for Burr Applications before mounting them.
+
+``authiro doctor module:attr`` runs a set of checks against an
+Application (or a factory returning one) and reports findings without
+ever calling ``astep``. Catches the classes of bug that only surface at
+runtime against the real MCP client:
+
+* import target unresolvable
+* factory raises on build
+* graph has unreachable actions
+* graph has dead-end actions (no outgoing transitions other than the
+  terminal node the author intended)
+* actions read state keys that nothing writes and nothing seeds in
+  ``with_state(...)``
+* initial state defines keys no action ever reads (loose noise, not an
+  error but worth surfacing)
+
+Importable as a library too: ``from authiro.doctor import run_checks``
+returns a :class:`DoctorReport` you can fold into your own test suite.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any
+
+from burr.core import Application
+
+from authiro._introspect import _INTERNAL_STATE_KEYS
+
+
+class CheckStatus(str, Enum):  # noqa: UP042  # match adapter.ServingMode convention
+    """Severity of one doctor finding; only FAIL blocks ``DoctorReport.ok``."""
+
+    PASS = "pass"
+    FAIL = "fail"
+    WARN = "warn"
+    INFO = "info"
+
+
+@dataclass
+class CheckResult:
+    """One row in the doctor's findings table.
+
+    ``name`` is a short label; ``message`` is a one-liner; ``details``
+    is a list of follow-up lines printed only in verbose mode (or when
+    the status is fail/warn).
+    """
+
+    name: str
+    status: CheckStatus
+    message: str = ""
+    details: list[str] = field(default_factory=list)
+
+
+@dataclass
+class DoctorReport:
+    """The doctor's findings: one ``CheckResult`` per check, plus tallies."""
+
+    checks: list[CheckResult] = field(default_factory=list)
+
+    @property
+    def passed(self) -> int:
+        """Count of PASS findings."""
+        return sum(1 for c in self.checks if c.status == CheckStatus.PASS)
+
+    @property
+    def failed(self) -> int:
+        """Count of FAIL findings."""
+        return sum(1 for c in self.checks if c.status == CheckStatus.FAIL)
+
+    @property
+    def warnings(self) -> int:
+        """Count of WARN findings."""
+        return sum(1 for c in self.checks if c.status == CheckStatus.WARN)
+
+    @property
+    def info(self) -> int:
+        """Count of INFO findings."""
+        return sum(1 for c in self.checks if c.status == CheckStatus.INFO)
+
+    @property
+    def ok(self) -> bool:
+        """True if no failures.
+
+        Warnings don't block; they're for the author's eyes.
+        """
+        return self.failed == 0
+
+
+def run_checks(application: Any, *, runtime: bool = False) -> DoctorReport:
+    """Validate a Burr Application or a callable that returns one.
+
+    A callable is invoked once to obtain the Application. Any
+    exception during that call becomes a :class:`CheckStatus.FAIL`
+    finding and short-circuits the remaining graph-level checks (we
+    can't introspect a graph we couldn't build).
+
+    With ``runtime=True``, also spin up a real ``mount()`` server and
+    probe its wire shape: tool listing, resource listing, ``step``
+    output shape (headline at content[0], ``structured_content``
+    populated). Useful for confirming the polish surfaces are wired
+    end-to-end without a separate client.
+    """
+    report = DoctorReport()
+
+    app = _resolve_application(application, report)
+    if app is None:
+        return report
+
+    report.checks.extend(_check_graph_topology(app))
+    report.checks.extend(_check_state_contract(app))
+    report.checks.extend(_check_initial_state_usage(app))
+    report.checks.extend(_check_sync_actions_with_persister(application, app))
+    # The ledger-mode check only applies if the application actually writes a
+    # ledger (i.e. a LocalTrackingClient is wired). Without a tracker, the
+    # ledger code path is a no-op and the warning would be a false positive.
+    if getattr(app, "_tracker", None) is not None:
+        report.checks.extend(_check_ledger_key_mode())
+
+    if runtime:
+        report.checks.extend(_check_runtime(application, app))
+    return report
+
+
+def _check_ledger_key_mode() -> list[CheckResult]:
+    """Warn when the ledger is running in unkeyed SHA-only mode.
+
+    Detects in-place edits, reorderings, and middle-deletions; does NOT detect
+    whole-cloth forgery (an operator with write access to ``ledger.jsonl`` can
+    mint a chain from scratch). Setting ``AUTHIRO_LEDGER_KEY`` to a hex string
+    in the environment switches the chain to HMAC-SHA-256; forgery then
+    requires the key. See ``src/authiro/ledger.py`` for the threat model.
+    """
+    import os
+
+    if os.environ.get("AUTHIRO_LEDGER_KEY"):
+        return [
+            CheckResult(
+                name="Ledger integrity mode",
+                status=CheckStatus.PASS,
+                message="AUTHIRO_LEDGER_KEY set: ledger writes use HMAC-SHA-256.",
+            )
+        ]
+    return [
+        CheckResult(
+            name="Ledger integrity mode",
+            status=CheckStatus.WARN,
+            message=("AUTHIRO_LEDGER_KEY not set: ledger writes use plain SHA-256."),
+            details=[
+                "Catches in-place edits, reorderings, and middle-deletions.",
+                "Does NOT catch whole-cloth forgery by an operator with write access.",
+                "Set AUTHIRO_LEDGER_KEY=<hex bytes> to switch the chain to HMAC mode.",
+            ],
+        )
+    ]
+
+
+def _resolve_application(application: Any, report: DoctorReport) -> Application[Any] | None:
+    """Coax ``application`` into a concrete ``burr.core.Application``.
+
+    Accepts: an Application instance, or a callable returning either an
+    Application or an unbuilt ``ApplicationBuilder`` (the builder seam, the
+    same shapes ``mount()`` accepts). A returned builder is built with its
+    tracker suppressed, since this is static introspection.
+    """
+    from burr.core import ApplicationBuilder
+
+    from authiro.adapter import _build_session_app
+
+    if isinstance(application, Application):
+        report.checks.append(
+            CheckResult(
+                "Resolve target",
+                CheckStatus.PASS,
+                "got an Application instance",
+            )
+        )
+        return application
+
+    if callable(application):
+        try:
+            built = application()
+        except Exception as exc:
+            report.checks.append(
+                CheckResult(
+                    "Resolve target",
+                    CheckStatus.FAIL,
+                    f"factory raised {type(exc).__name__}: {exc}",
+                )
+            )
+            return None
+        if isinstance(built, ApplicationBuilder):
+            built = _build_session_app(built, "authiro-doctor", suppress_tracker=True)
+            detail = "factory built an Application (from a builder)"
+        elif isinstance(built, Application):
+            detail = "factory built an Application"
+        else:
+            report.checks.append(
+                CheckResult(
+                    "Resolve target",
+                    CheckStatus.FAIL,
+                    f"factory returned {type(built).__name__}, "
+                    f"not a Burr Application or ApplicationBuilder",
+                )
+            )
+            return None
+        report.checks.append(CheckResult("Resolve target", CheckStatus.PASS, detail))
+        return built
+
+    report.checks.append(
+        CheckResult(
+            "Resolve target",
+            CheckStatus.FAIL,
+            f"target is {type(application).__name__}, not an Application or callable",
+        )
+    )
+    return None
+
+
+# COMPLEXITY: CC 14 — BFS reachability plus two findings with pass/fail
+# variants; the traversal and its reporting belong together.
+def _check_graph_topology(app: Application[Any]) -> list[CheckResult]:
+    """Reachability + dead-end detection.
+
+    Two findings:
+    * "Graph reachability": fail if any action is unreachable from the
+      entrypoint via the declared transitions.
+    * "Terminal actions": info-level listing of actions with no
+      outgoing transitions. Often intentional (a fulfilled order, a
+      closed incident) but worth surfacing so authors notice an
+      accidental dead-end.
+    """
+    actions = list(app.graph.actions)
+    transitions = list(app.graph.transitions)
+    entrypoint = app.graph.entrypoint.name
+
+    all_names = {a.name for a in actions}
+    outgoing: dict[str, list[str]] = {name: [] for name in all_names}
+    for t in transitions:
+        outgoing.setdefault(t.from_.name, []).append(t.to.name)
+
+    reached: set[str] = set()
+    queue: deque[str] = deque([entrypoint])
+    while queue:
+        cur = queue.popleft()
+        if cur in reached:
+            continue
+        reached.add(cur)
+        for nxt in outgoing.get(cur, []):
+            if nxt not in reached:
+                queue.append(nxt)
+
+    results: list[CheckResult] = []
+    unreachable = sorted(all_names - reached)
+    if unreachable:
+        results.append(
+            CheckResult(
+                "Graph reachability",
+                CheckStatus.FAIL,
+                f"{len(unreachable)} unreachable action(s) from entrypoint {entrypoint!r}",
+                details=[f"unreachable: {name}" for name in unreachable],
+            )
+        )
+    else:
+        results.append(
+            CheckResult(
+                "Graph reachability",
+                CheckStatus.PASS,
+                f"all {len(all_names)} action(s) reachable from {entrypoint!r}",
+            )
+        )
+
+    terminals = sorted(name for name in all_names if not outgoing.get(name))
+    if terminals:
+        results.append(
+            CheckResult(
+                "Terminal actions",
+                CheckStatus.INFO,
+                f"{len(terminals)} action(s) with no outgoing transitions",
+                details=[f"terminal: {name}" for name in terminals],
+            )
+        )
+    else:
+        # A graph with no terminal is legitimate (long-lived sessions cycle
+        # forever), but worth surfacing: an agent driving it will never see
+        # an empty valid-next set, so "done" must come from the client side.
+        results.append(
+            CheckResult(
+                "Terminal actions",
+                CheckStatus.INFO,
+                "no terminal actions: every action has an outgoing transition "
+                "(the FSM cycles; sessions end by client disconnect or reset_session)",
+            )
+        )
+    return results
+
+
+def _check_state_contract(app: Application[Any]) -> list[CheckResult]:
+    """Check every read state key has a writer or a ``with_state`` seed.
+
+    Otherwise the first read yields ``None`` (or KeyError, depending on
+    how the action is written), which is almost always a bug. Reported
+    as a warning rather than a failure because authors occasionally
+    rely on ``state.get(k, default)`` and reading-then-defaulting is
+    legitimate.
+    """
+    initial_keys = set(app.state.get_all().keys()) - _INTERNAL_STATE_KEYS
+    writable: set[str] = initial_keys.copy()
+    for a in app.graph.actions:
+        writable.update(a.writes or [])
+
+    problems: list[str] = []
+    for a in app.graph.actions:
+        missing = [r for r in (a.reads or []) if r not in writable]
+        if missing:
+            problems.append(f"{a.name} reads {missing} (nothing writes or seeds them)")
+
+    if problems:
+        return [
+            CheckResult(
+                "State contract",
+                CheckStatus.WARN,
+                f"{len(problems)} action(s) read state keys with no writer or seed",
+                details=problems,
+            )
+        ]
+    return [
+        CheckResult(
+            "State contract",
+            CheckStatus.PASS,
+            "every action's reads are covered by writes or initial state",
+        )
+    ]
+
+
+def _check_initial_state_usage(app: Application[Any]) -> list[CheckResult]:
+    """Flag initial-state keys nothing reads AND nothing writes.
+
+    A key that's seeded then written-but-never-read is part of the
+    public state contract the MCP client sees via ``authiro://state``,
+    not orphan. Only keys that nobody reads *and* nobody writes are
+    dead weight worth surfacing.
+    """
+    initial_keys = set(app.state.get_all().keys()) - _INTERNAL_STATE_KEYS
+    read_keys: set[str] = set()
+    write_keys: set[str] = set()
+    for a in app.graph.actions:
+        read_keys.update(a.reads or [])
+        write_keys.update(a.writes or [])
+
+    orphan = sorted(initial_keys - read_keys - write_keys)
+    if orphan:
+        return [
+            CheckResult(
+                "Initial state usage",
+                CheckStatus.INFO,
+                f"{len(orphan)} initial-state key(s) no action reads or writes",
+                details=[f"orphan: {k}" for k in orphan],
+            )
+        ]
+    return [
+        CheckResult(
+            "Initial state usage",
+            CheckStatus.PASS,
+            "every initial-state key is read or written by at least one action",
+        )
+    ]
+
+
+# COMPLEXITY: CC 14 — cross-product of (sync/async body) x (persister,
+# tracker) detection; one check, four detection legs.
+def _check_sync_actions_with_persister(
+    application: Any, app: Application[Any]
+) -> list[CheckResult]:
+    """Warn when sync action bodies coexist with a persister or tracker.
+
+    Burr's ``post_run_step`` hook fires with pre-action state when the
+    action body is sync, so persister snapshots and tracker ``end_entry``
+    rows record the wrong state for sync-bodied actions. The CLI works
+    around this for non-terminal rows by forward-scanning, but the
+    terminal row's state stays stale and any session resumed via
+    ``fork_from_past`` resumes from the wrong snapshot. Writing the action
+    body ``async def`` (Burr ``astep`` awaits it; the hook then sees
+    post-state) avoids the trap entirely.
+    """
+    import inspect
+
+    # Burr stores the persister at ``_state_persister`` (set by
+    # ``with_state_persister``) and lifecycle adapters live on
+    # ``_adapter_set._adapters``, not ``_lifecycle_adapters``. The earlier
+    # name guesses silently no-op'd, so this WARN never fired for real
+    # persister setups; an SRE persona hit the bug in dogfood (L).
+    adapter_set = getattr(app, "_adapter_set", None)
+    adapters: list[Any] = list(
+        getattr(adapter_set, "_adapters", None) or getattr(app, "_lifecycle_adapters", None) or ()
+    )
+    has_persister = getattr(app, "_state_persister", None) is not None or any(
+        type(h).__name__.endswith(("Persister", "PersisterHook")) for h in adapters
+    )
+    has_tracker = getattr(app, "_tracker", None) is not None or any(
+        "Tracker" in type(h).__name__ for h in adapters
+    )
+    if not (has_persister or has_tracker):
+        return []
+    sync_actions: list[str] = []
+    for a in app.graph.actions:
+        fn = getattr(a, "fn", None)
+        if fn is None:
+            continue
+        if not inspect.iscoroutinefunction(fn):
+            sync_actions.append(a.name)
+    if not sync_actions:
+        return [
+            CheckResult(
+                "Sync action bodies with persister/tracker",
+                CheckStatus.PASS,
+                "all action bodies are async def",
+            )
+        ]
+    return [
+        CheckResult(
+            "Sync action bodies with persister/tracker",
+            CheckStatus.WARN,
+            f"{len(sync_actions)} sync action body/bodies coexist with a persister or tracker",
+            details=[
+                f"{name} is sync; consider 'async def' so Burr's post_run_step "
+                f"records post-action state (Burr's astep+sync bug)."
+                for name in sync_actions
+            ],
+        )
+    ]
+
+
+def _probe_tool_surface(tools: set[str]) -> list[CheckResult]:
+    """Wire checks for the native tools and the ResourcesAsTools transform."""
+    results: list[CheckResult] = []
+    missing = {"step", "reset_session", "fork_at"} - tools
+    if missing:
+        results.append(
+            CheckResult(
+                "Runtime: native tools",
+                CheckStatus.FAIL,
+                f"missing tools: {sorted(missing)}",
+            )
+        )
+    else:
+        results.append(
+            CheckResult(
+                "Runtime: native tools",
+                CheckStatus.PASS,
+                f"step + reset_session + fork_at present ({len(tools)} total)",
+            )
+        )
+    ras_missing = {"list_resources", "read_resource"} - tools
+    if ras_missing:
+        results.append(
+            CheckResult(
+                "Runtime: ResourcesAsTools",
+                CheckStatus.FAIL,
+                f"transform tools missing: {sorted(ras_missing)}",
+            )
+        )
+    else:
+        results.append(
+            CheckResult(
+                "Runtime: ResourcesAsTools",
+                CheckStatus.PASS,
+                "list_resources + read_resource exposed",
+            )
+        )
+    return results
+
+
+def _probe_fork_from_past_visibility(app: Application[Any], tools: set[str]) -> CheckResult:
+    """fork_from_past visibility is conditional; report which path applies."""
+    try:
+        from burr.tracking.client import LocalTrackingClient
+
+        has_tracker = isinstance(getattr(app, "_tracker", None), LocalTrackingClient)
+    except ImportError:
+        has_tracker = False
+    ffp_visible = "fork_from_past" in tools
+    if has_tracker and ffp_visible:
+        return CheckResult(
+            "Runtime: fork_from_past visibility",
+            CheckStatus.PASS,
+            "tracker attached and fork_from_past visible",
+        )
+    if not has_tracker and not ffp_visible:
+        return CheckResult(
+            "Runtime: fork_from_past visibility",
+            CheckStatus.PASS,
+            "no tracker; fork_from_past hidden by Visibility transform",
+        )
+    return CheckResult(
+        "Runtime: fork_from_past visibility",
+        CheckStatus.WARN,
+        f"visibility mismatch (has_tracker={has_tracker}, visible={ffp_visible})",
+    )
+
+
+def _probe_resource_catalog(resource_uris: set[str]) -> CheckResult:
+    """Check that every authiro:// resource is registered."""
+    expected_resources = {
+        "authiro://graph",
+        "authiro://state",
+        "authiro://next",
+        "authiro://history",
+        "authiro://trace",
+        "authiro://session",
+        "authiro://subruns",
+    }
+    r_missing = expected_resources - resource_uris
+    if r_missing:
+        return CheckResult(
+            "Runtime: resources",
+            CheckStatus.FAIL,
+            f"missing resources: {sorted(r_missing)}",
+        )
+    return CheckResult(
+        "Runtime: resources",
+        CheckStatus.PASS,
+        f"{len(expected_resources)} authiro:// resources registered",
+    )
+
+
+def _probe_step_result_shape(r: Any) -> CheckResult:
+    """Check a step result's wire shape: headline, json, structured_content."""
+    problems: list[str] = []
+    if len(r.content) < 2:
+        problems.append(f"expected >=2 content blocks (headline + json), got {len(r.content)}")
+    elif not r.content[0].text.startswith("Step "):
+        problems.append(f"content[0] doesn't look like a headline: {r.content[0].text[:60]!r}")
+    if r.structured_content is None:
+        problems.append("structured_content is None (expected populated dict)")
+    elif not isinstance(r.structured_content, dict):
+        problems.append(
+            f"structured_content has wrong shape: {type(r.structured_content).__name__}"
+        )
+    if problems:
+        return CheckResult(
+            "Runtime: step result shape",
+            CheckStatus.FAIL,
+            f"{len(problems)} shape issue(s)",
+            details=problems,
+        )
+    return CheckResult(
+        "Runtime: step result shape",
+        CheckStatus.PASS,
+        "content[0]=headline, content[1]=json, structured_content=dict",
+    )
+
+
+def _check_runtime(application: Any, app: Application[Any]) -> list[CheckResult]:
+    """Mount the server in-process and probe its wire shape.
+
+    Verifies the four-tool surface, the ResourcesAsTools transform tools,
+    the resource catalog, and the ``step`` result shape (headline at
+    content[0], JSON at content[1], ``structured_content`` populated).
+    The step probe calls the entrypoint action with empty inputs and
+    accepts any outcome (success or refusal); the test is the wire
+    shape, not the FSM semantics.
+    """
+    import asyncio
+
+    async def _probe() -> list[CheckResult]:
+        from fastmcp import Client
+
+        from authiro.adapter import ServingMode, mount
+
+        results: list[CheckResult] = []
+        try:
+            server = mount(application, mode=ServingMode.STEP, name="doctor-probe")
+        except Exception as exc:
+            return [
+                CheckResult(
+                    "Runtime: mount",
+                    CheckStatus.FAIL,
+                    f"mount() raised {type(exc).__name__}: {exc}",
+                )
+            ]
+        results.append(CheckResult("Runtime: mount", CheckStatus.PASS, "server built"))
+
+        async with Client(server) as client:
+            tools = {t.name for t in await client.list_tools()}
+            results.extend(_probe_tool_surface(tools))
+            results.append(_probe_fork_from_past_visibility(app, tools))
+
+            resources = await client.list_resources()
+            results.append(_probe_resource_catalog({str(r.uri) for r in resources}))
+
+            # Probe step with a deliberately unknown action. We're
+            # checking the wire shape (headline + json + structured),
+            # not the FSM body. Unknown_action gives a clean refusal
+            # without exercising Burr's action runner.
+            r = await client.call_tool(
+                "step",
+                {"action": "__doctor_probe__", "inputs": {}},
+            )
+            results.append(_probe_step_result_shape(r))
+
+        return results
+
+    try:
+        return asyncio.run(_probe())
+    except Exception as exc:
+        return [
+            CheckResult(
+                "Runtime: probe",
+                CheckStatus.FAIL,
+                f"probe raised {type(exc).__name__}: {exc}",
+            )
+        ]
+
+
+# ── formatting ──────────────────────────────────────────────────────
+
+
+_STATUS_TAG = {
+    CheckStatus.PASS: "[PASS]",
+    CheckStatus.FAIL: "[FAIL]",
+    CheckStatus.WARN: "[WARN]",
+    CheckStatus.INFO: "[INFO]",
+}
+
+
+# COMPLEXITY: CC 12 — verbosity x status rendering matrix for the report;
+# a formatter dispatch table would obscure the output layout.
+def format_report(report: DoctorReport, verbose: bool = False) -> str:
+    """Render a :class:`DoctorReport` for the CLI.
+
+    ``verbose=True`` prints every check's message and details. Default
+    keeps PASS rows to a single line and only expands FAIL/WARN/INFO
+    details, the same density a developer expects from ``ruff`` or
+    ``mypy``.
+    """
+    lines: list[str] = []
+    for c in report.checks:
+        tag = _STATUS_TAG[c.status]
+        head = f"{tag} {c.name}"
+        if c.message:
+            head += f": {c.message}"
+        lines.append(head)
+        show_details = verbose or c.status in (
+            CheckStatus.FAIL,
+            CheckStatus.WARN,
+            CheckStatus.INFO,
+        )
+        if show_details and c.details:
+            lines.extend(f"       {d}" for d in c.details)
+
+    parts: list[str] = []
+    if report.passed:
+        parts.append(f"{report.passed} passed")
+    if report.failed:
+        parts.append(f"{report.failed} failed")
+    if report.warnings:
+        parts.append(f"{report.warnings} warnings")
+    if report.info:
+        parts.append(f"{report.info} info")
+    lines.extend(("", "Doctor: " + (", ".join(parts) if parts else "no checks ran")))
+    return "\n".join(lines)
+
+
+__all__ = [
+    "CheckResult",
+    "CheckStatus",
+    "DoctorReport",
+    "format_report",
+    "run_checks",
+]

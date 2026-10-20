@@ -1,0 +1,45 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.burr/
+~/.burr/
+
+# Local notes; intentionally not tracked.
+CLAUDE.md
+
+# Agent-generated scratch docs from bench runs (written to cwd by SKILL-arm agents)
+/auth-*.md
+/decision-doc*.md
+# Machine-local agent/client state (settings, local overrides, task locks)
+.claude/
+# Benchmark run outputs (regenerable; curated sets attach to GitHub releases, not main)
+bench/traces/
+site/
+
+# VHS Screenshot verification frames (regenerable from the .tape files)
+demos/*.png
+
+# internal grounding notes (not published)
+research/
+
+# Local secrets (never commit)
+.env
+
+# design handoff artifact (not tracked)
+Authiro.zip
+scratch/
+
+# mutation-testing working trees / caches; gitleaks local report
+mutants/
+.mutmut-cache
+.gl-report.json
+.analysis/

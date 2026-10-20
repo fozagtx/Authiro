@@ -1,0 +1,145 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "0 4 * * 1" # weekly mutation testing, Monday 04:00 UTC
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  # Fast gate: every static check, one Python, fails before the matrix spends
+  # minutes. Tool configs live in pyproject.toml; no flags are duplicated here
+  # beyond the target paths.
+  lint-and-type:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v8.1.0
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv sync
+      - name: format
+        run: uv run ruff format --check .
+      - name: lint
+        run: uv run ruff check .
+      - name: type-check (strict baseline from pyproject)
+        run: uv run mypy src/authiro
+      - name: bandit (fail on medium or high)
+        run: uv run bandit -r src/authiro --severity-level medium
+      - name: vulture (dead code; whitelist in vulture_whitelist.py)
+        run: uvx vulture
+      # Pinned: complexipy 6.0 rescored the same code higher (the 5.x cap of
+      # 15 corresponds to 18 under 6.x); unpinned, CI flips red on tool
+      # releases with zero code change. Bump the pin and cap together, in
+      # lockstep with scripts/check.sh.
+      - name: complexipy (cognitive complexity hard cap)
+        run: uvx complexipy@6.2.0 src/authiro -mx 18
+      - name: detect-secrets (new findings vs audited baseline)
+        run: uvx detect-secrets scan src/ tests/ examples/ --all-files --baseline .secrets.baseline
+
+  test-matrix:
+    if: github.event_name != 'schedule'
+    needs: lint-and-type
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v8.1.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+      - run: uv sync
+      - name: test
+        run: uv run pytest -q --cov=authiro --cov-report=term-missing
+
+  security:
+    if: github.event_name != 'schedule'
+    needs: lint-and-type
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v8.1.0
+        with:
+          python-version: "3.12"
+      - name: pip-audit (dependency vulnerabilities)
+        run: uvx pip-audit
+
+  secrets:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: gitleaks (secret scan; .gitleaks.toml allowlists fixture data)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Install the built wheel against the newest in-range dependencies (NOT the
+  # lockfile) and exercise it, so a fresh user's dependency floor is tested,
+  # not just the pinned dev env. This is the gate that catches the class of
+  # regression the lock masked (e.g. the typer-0.26 vendored-click break).
+  fresh-install:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.14"]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v8.1.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: build wheel
+        run: uv build --wheel
+      - name: install wheel into a clean env (resolves newest in-range deps)
+        run: |
+          uv venv /tmp/fresh
+          uv pip install --python /tmp/fresh/bin/python dist/*.whl pytest pytest-asyncio
+      - name: offline primer runs
+        run: /tmp/fresh/bin/authiro primer > /dev/null
+      - name: CLI usage errors render cleanly (exit 2, no traceback)
+        run: |
+          rc=0; /tmp/fresh/bin/authiro sessions ls --app-dir nope || rc=$?
+          test "$rc" -eq 2
+          rc=0; /tmp/fresh/bin/authiro bogus-command || rc=$?
+          test "$rc" -eq 2
+      - name: CLI + regression tests against the freshly-installed wheel
+        run: /tmp/fresh/bin/python -m pytest tests/test_cli.py tests/test_paper_cut_fixes.py -q -p no:cacheprovider
+
+  # Mutation testing on the audit ledger: too slow per PR, so it runs on the
+  # weekly schedule only. Zero surviving mutants is the gate.
+  mutation:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v8.1.0
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv sync
+      - name: mutmut run (config in pyproject [tool.mutmut])
+        run: uv run mutmut run
+      - name: results (fails the job if any mutant survived)
+        run: |
+          uv run mutmut results | tee results.txt
+          ! grep -qE "survived|no tests" results.txt

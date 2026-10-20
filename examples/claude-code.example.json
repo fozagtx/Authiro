@@ -1,0 +1,159 @@
+{
+  "_comment": "Several authiro example servers wired up for Claude Code. Copy this to your project's .mcp.json (or paste into ~/.claude.json under mcpServers) after editing the absolute path. Then run `claude` from this project and use /mcp to confirm. Each server is self-contained: no APIs, no shell, no auth. Just prompt and try to break the gates.",
+  "mcpServers": {
+    "coffee": {
+      "type": "stdio",
+      "command": "uv",
+      "args": [
+        "--directory",
+        "/ABSOLUTE/PATH/TO/authiro",
+        "run",
+        "authiro",
+        "serve",
+        "coffee_order:build_application",
+        "--app-dir",
+        "examples"
+      ]
+    },
+    "adventure": {
+      "type": "stdio",
+      "command": "uv",
+      "args": [
+        "--directory",
+        "/ABSOLUTE/PATH/TO/authiro",
+        "run",
+        "authiro",
+        "serve",
+        "adventure:build_application",
+        "--app-dir",
+        "examples"
+      ]
+    },
+    "chargen": {
+      "type": "stdio",
+      "command": "uv",
+      "args": [
+        "--directory",
+        "/ABSOLUTE/PATH/TO/authiro",
+        "run",
+        "authiro",
+        "serve",
+        "chargen:build_application",
+        "--app-dir",
+        "examples"
+      ]
+    },
+    "burr-shell": {
+      "type": "stdio",
+      "command": "uv",
+      "args": [
+        "--directory",
+        "/ABSOLUTE/PATH/TO/authiro",
+        "run",
+        "authiro",
+        "serve",
+        "local_shell:build_application",
+        "--app-dir",
+        "examples"
+      ]
+    },
+    "granite-oncall": {
+      "type": "stdio",
+      "command": "uv",
+      "args": [
+        "--directory",
+        "/ABSOLUTE/PATH/TO/authiro",
+        "run",
+        "authiro",
+        "serve",
+        "granite_oncall:build_application",
+        "--app-dir",
+        "examples"
+      ]
+    },
+    "burr-unix-health": {
+      "type": "stdio",
+      "command": "uv",
+      "args": [
+        "--directory",
+        "/ABSOLUTE/PATH/TO/authiro",
+        "run",
+        "authiro",
+        "serve",
+        "unix_health:build_application",
+        "--app-dir",
+        "examples"
+      ]
+    },
+    "codebase-security": {
+      "type": "stdio",
+      "command": "uv",
+      "args": [
+        "--directory",
+        "/ABSOLUTE/PATH/TO/authiro",
+        "run",
+        "authiro",
+        "serve",
+        "codebase_security:build_application",
+        "--app-dir",
+        "examples"
+      ]
+    },
+    "adaptive-crag": {
+      "type": "stdio",
+      "command": "uv",
+      "args": [
+        "--directory",
+        "/ABSOLUTE/PATH/TO/authiro",
+        "run",
+        "authiro",
+        "serve",
+        "adaptive_crag:build_application",
+        "--app-dir",
+        "examples"
+      ]
+    },
+    "security-audit": {
+      "type": "stdio",
+      "command": "uv",
+      "args": [
+        "--directory",
+        "/ABSOLUTE/PATH/TO/authiro",
+        "run",
+        "authiro",
+        "serve",
+        "security_audit:build_application",
+        "--app-dir",
+        "examples"
+      ]
+    },
+    "mellea-qiskit-migration": {
+      "type": "stdio",
+      "command": "uv",
+      "args": [
+        "--directory",
+        "/ABSOLUTE/PATH/TO/authiro",
+        "run",
+        "authiro",
+        "serve",
+        "mellea_qiskit_migration:build_application",
+        "--app-dir",
+        "examples"
+      ]
+    },
+    "incident-response": {
+      "type": "stdio",
+      "command": "uv",
+      "args": [
+        "--directory",
+        "/ABSOLUTE/PATH/TO/authiro",
+        "run",
+        "authiro",
+        "serve",
+        "incident_response:build_application",
+        "--app-dir",
+        "examples"
+      ]
+    }
+  }
+}

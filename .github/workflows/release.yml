@@ -1,0 +1,50 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v8.1.0
+      - run: uv build
+      - run: uvx twine check dist/*
+      - name: SBOM (CycloneDX, runtime dependencies)
+        run: |
+          uv export --no-dev --no-emit-project --format requirements-txt -o requirements.txt
+          mkdir -p sbom
+          uvx cyclonedx-py requirements requirements.txt -o sbom/authiro.cdx.json
+      # dist/ holds only the wheel + sdist; the publish step uploads everything
+      # in it, so the SBOM must live elsewhere or PyPI rejects it.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+      - uses: actions/upload-artifact@v7
+        with:
+          name: sbom
+          path: sbom/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/authiro/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true

@@ -1,0 +1,572 @@
+"""``authiro sessions ls/show/tail`` plus ``watch`` and ``logs``."""
+
+from __future__ import annotations
+
+import json
+import time
+from pathlib import Path
+from typing import Annotated, Any
+
+import typer
+from rich.console import Group
+from rich.live import Live
+from rich.table import Table
+from rich.text import Text
+
+from authiro.cli._branding import brand_display_name, console, err_console
+from authiro.cli._resolve import (
+    _burr_ui_url,
+    _locate_project_home,
+    _resolve_app,
+    _resolve_home,
+)
+from authiro.cli._steps import (
+    _build_steps_table,
+    _read_refusals,
+    _read_steps,
+    _relative_when,
+    _scan_app_entry,
+    _short_ts,
+    _state_diff_text,
+    _status_text,
+    _ts_sort_key,
+)
+
+
+def _console_line(ui_url: str) -> str:
+    """The session-console link plus the reminder that nothing serves it by default."""
+    return (
+        f"[muted]{brand_display_name()} console:[/] [link={ui_url}]{ui_url}[/]"
+        f"  [dim](serve it with: authiro ui)[/]"
+    )
+
+
+def _session_project_dirs(home: Path, project: str | None) -> list[Path]:
+    """Project subdirs under ``home``, newest first, optionally filtered."""
+    dirs = sorted(
+        (p for p in home.iterdir() if p.is_dir() and not p.name.startswith(".")),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    return [p for p in dirs if p.name == project] if project else dirs
+
+
+def _sessions_renderable(home: Path, project: str | None, *, limit: int, show_all: bool) -> Group:
+    """Build the session roster as a rich renderable (one table per project)."""
+    payload = _collect_sessions_payload(
+        _session_project_dirs(home, project), limit=limit, show_all=show_all
+    )
+    if not payload:
+        return Group(Text(f"No sessions under {home}", style="dim"))
+    return Group(*(_build_sessions_table(e) for e in payload))
+
+
+def _watch_sessions(
+    home: Path, project: str | None, *, limit: int, show_all: bool, poll_interval: float
+) -> None:
+    """Live-refresh the session roster until Ctrl-C."""
+
+    def render() -> Group:
+        return _sessions_renderable(home, project, limit=limit, show_all=show_all)
+
+    try:
+        with Live(render(), console=console, refresh_per_second=4, screen=False) as view:
+            while True:
+                time.sleep(poll_interval)
+                view.update(render())
+    except KeyboardInterrupt:
+        console.print("[dim](stopped)[/]")
+
+
+def _collect_sessions_payload(
+    project_dirs: list[Path], *, limit: int, show_all: bool
+) -> list[dict[str, Any]]:
+    payload: list[dict[str, Any]] = []
+    for proj in project_dirs:
+        app_dirs = sorted(
+            (p for p in proj.iterdir() if p.is_dir()),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )[:limit]
+        entries = [
+            entry for a in app_dirs if (entry := _scan_app_entry(a, show_all=show_all)) is not None
+        ]
+        payload.append({"project": proj.name, "apps": entries})
+    return payload
+
+
+def _build_sessions_table(proj_entry: dict[str, Any]) -> Table:
+    table = Table(
+        title=f"[header]{proj_entry['project']}/[/]",
+        title_justify="left",
+        expand=True,
+        show_lines=False,
+        border_style="muted",
+    )
+    table.add_column("app_id", no_wrap=True, style="muted", width=12)
+    table.add_column("when", no_wrap=True, style="subtle", width=8)
+    table.add_column("steps", justify="right", width=6, no_wrap=True)
+    table.add_column("", width=1, no_wrap=True)
+    table.add_column("last action", no_wrap=True, style="action")
+    for app_entry in proj_entry["apps"]:
+        table.add_row(
+            app_entry["app_id"][:12],
+            _relative_when(app_entry["mtime"]),
+            str(app_entry["steps"]),
+            _status_text(app_entry["last_status"]),
+            (app_entry["last_action"] or "")[:18],
+        )
+    return table
+
+
+# COMPLEXITY: CC 12 — filter/limit/json/empty-store rendering combinations
+# of one listing command.
+def sessions_ls(
+    home: Annotated[
+        Path | None,
+        typer.Option(
+            "--home", help="Tracker storage root. Overrides the CLI default (see --help)."
+        ),
+    ] = None,
+    project: Annotated[
+        str | None,
+        typer.Option("--project", "-p", help="Filter to a single project."),
+    ] = None,
+    limit: Annotated[
+        int,
+        typer.Option("--limit", "-n", help="Max recent apps to show per project."),
+    ] = 8,
+    show_all: Annotated[
+        bool,
+        typer.Option(
+            "--all",
+            help=(
+                "Include empty tracker entries (created by FastMCP on connect "
+                "but never advanced). Default hides them."
+            ),
+        ),
+    ] = False,
+    as_json: Annotated[
+        bool, typer.Option("--json", help="Emit JSON instead of a rich table.")
+    ] = False,
+    watch: Annotated[
+        bool,
+        typer.Option("--watch", help="Live-refresh the session roster until Ctrl-C."),
+    ] = False,
+    poll_interval: Annotated[
+        float, typer.Option("--poll", help="Polling interval in seconds when --watch.")
+    ] = 1.0,
+) -> None:
+    """Table of recent tracked sessions, most recent first."""
+    home = _locate_project_home(home, project)
+    if not home.exists():
+        err_console.print(f"[err]No Burr tracker storage at[/] {home}")
+        raise typer.Exit(code=1)
+
+    # Unknown-project is a hard error for one-shot modes; under --watch the
+    # project may not exist yet (the session could start while watching).
+    if (
+        project
+        and not watch
+        and not any(p.name == project for p in _session_project_dirs(home, project))
+    ):
+        err_console.print(f"[err]No such project under[/] {home}: {project!r}")
+        raise typer.Exit(code=1)
+
+    if as_json:
+        dirs = _session_project_dirs(home, project)
+        console.print_json(
+            json.dumps(_collect_sessions_payload(dirs, limit=limit, show_all=show_all))
+        )
+        return
+
+    if not watch:
+        console.print(_sessions_renderable(home, project, limit=limit, show_all=show_all))
+        return
+    _watch_sessions(home, project, limit=limit, show_all=show_all, poll_interval=poll_interval)
+
+
+def sessions_show(
+    app_id: Annotated[
+        str | None,
+        typer.Argument(help="App id (full uuid or prefix). Defaults to most recent."),
+    ] = None,
+    project: Annotated[
+        str | None,
+        typer.Option("--project", "-p", help="Project name. Defaults to most recent."),
+    ] = None,
+    home: Annotated[
+        Path | None,
+        typer.Option(
+            "--home", help="Tracker storage root. Overrides the CLI default (see --help)."
+        ),
+    ] = None,
+    as_json: Annotated[
+        bool, typer.Option("--json", help="Emit JSON instead of a rich table.")
+    ] = False,
+    open_ui: Annotated[
+        bool,
+        typer.Option(
+            "--open",
+            help=(
+                "Open this session in the session console in the default browser "
+                "(honors BURR_UI_HOST / BURR_UI_PORT)."
+            ),
+        ),
+    ] = False,
+) -> None:
+    """Full post-mortem timeline of one session."""
+    home = _resolve_home(home)
+    log_path, proj, aid = _resolve_app(home, project, app_id)
+    steps = _read_steps(log_path)
+    refusals = _read_refusals(log_path)
+    rows = sorted(steps + refusals, key=_ts_sort_key)
+    resets = max((r.epoch for r in steps), default=0)
+    ui_url = _burr_ui_url(proj, aid)
+
+    if open_ui:
+        import webbrowser
+
+        webbrowser.open(ui_url)
+
+    if as_json:
+        console.print_json(
+            json.dumps(
+                {
+                    "project": proj,
+                    "app_id": aid,
+                    "log_path": str(log_path),
+                    "burr_ui_url": ui_url,
+                    "steps": [r.__dict__ for r in steps],
+                    "refusals": [r.__dict__ for r in refusals],
+                    "resets": resets,
+                }
+            )
+        )
+        return
+
+    if not rows:
+        console.print(f"[dim]No steps recorded yet at {log_path}[/]")
+        console.print(_console_line(ui_url))
+        return
+
+    suffix = f"  {len(steps)} step(s)"
+    if refusals:
+        suffix += f" · {len(refusals)} refused"
+    if resets:
+        suffix += f" · {resets} reset(s)"
+    table = _build_steps_table(rows, project=proj, app_id=aid, title_suffix=suffix)
+    console.print(table)
+    console.print(_console_line(ui_url))
+
+
+def _diff_state_dicts(
+    left: dict[str, Any], right: dict[str, Any]
+) -> tuple[list[str], list[str], list[tuple[str, Any, Any]]]:
+    """Return ``(only_in_left, only_in_right, changed)`` keys for two state dicts.
+
+    ``changed`` entries are ``(key, left_value, right_value)``. Both inputs are
+    post-filtered (``__SEQUENCE_ID`` etc already stripped by ``_read_steps``).
+    """
+    lk, rk = set(left), set(right)
+    only_left = sorted(lk - rk)
+    only_right = sorted(rk - lk)
+    changed = [(k, left[k], right[k]) for k in sorted(lk & rk) if left[k] != right[k]]
+    return only_left, only_right, changed
+
+
+def _print_action_path_diff(actions_a: list[str], actions_b: list[str]) -> None:
+    """Render the action-path comparison section of ``sessions diff``."""
+    if actions_a == actions_b:
+        console.print("\n[muted]action paths identical[/]")
+        return
+    console.print("\n[header]action path[/]")
+    common = 0
+    for a, b in zip(actions_a, actions_b, strict=False):
+        if a != b:
+            break
+        common += 1
+    console.print(f"  [muted]common prefix:[/] {common} step(s)")
+    if common < len(actions_a):
+        console.print(f"  [muted]A continues:[/] {' → '.join(actions_a[common:])}")
+    if common < len(actions_b):
+        console.print(f"  [muted]B continues:[/] {' → '.join(actions_b[common:])}")
+
+
+def _print_state_diff(
+    state_a: dict[str, Any],
+    state_b: dict[str, Any],
+    only_a: list[str],
+    only_b: list[str],
+    changed: list[tuple[str, Any, Any]],
+) -> None:
+    """Render the final-state comparison section of ``sessions diff``."""
+    console.print("\n[header]final state[/]")
+    if not (only_a or only_b or changed):
+        console.print("  [muted](identical)[/]")
+        return
+    for key, va, vb in changed:
+        console.print(
+            Text.assemble(
+                (f"  {key}: ", "muted"),
+                (str(va), "err"),
+                (" → ", "muted"),
+                (str(vb), "ok"),
+            )
+        )
+    for key in only_a:
+        console.print(Text.assemble((f"  -{key}: ", "err"), (str(state_a[key]), "muted")))
+    for key in only_b:
+        console.print(Text.assemble((f"  +{key}: ", "ok"), (str(state_b[key]), "muted")))
+
+
+def sessions_diff(
+    app_id_a: Annotated[
+        str,
+        typer.Argument(help="First session app id (full uuid or prefix)."),
+    ],
+    app_id_b: Annotated[
+        str,
+        typer.Argument(help="Second session app id (full uuid or prefix)."),
+    ],
+    project: Annotated[
+        str | None,
+        typer.Option("--project", "-p", help="Project name. Defaults to most recent."),
+    ] = None,
+    home: Annotated[
+        Path | None,
+        typer.Option(
+            "--home", help="Tracker storage root. Overrides the CLI default (see --help)."
+        ),
+    ] = None,
+    as_json: Annotated[
+        bool, typer.Option("--json", help="Emit JSON instead of a rich render.")
+    ] = False,
+) -> None:
+    """Diff two tracked sessions: action paths and final state.
+
+    Use to answer "what changed between this session and a known-good one?"
+    or "how did session B diverge from session A?". Reads only the tracker
+    JSONL; no live application needed.
+    """
+    home = _resolve_home(home)
+    log_a, proj_a, aid_a = _resolve_app(home, project, app_id_a)
+    log_b, proj_b, aid_b = _resolve_app(home, project, app_id_b)
+    rows_a = _read_steps(log_a)
+    rows_b = _read_steps(log_b)
+    actions_a = [r.action for r in rows_a]
+    actions_b = [r.action for r in rows_b]
+    state_a = rows_a[-1].state_summary if rows_a else {}
+    state_b = rows_b[-1].state_summary if rows_b else {}
+    only_a, only_b, changed = _diff_state_dicts(state_a, state_b)
+
+    if as_json:
+        console.print_json(
+            json.dumps(
+                {
+                    "a": {"project": proj_a, "app_id": aid_a, "actions": actions_a},
+                    "b": {"project": proj_b, "app_id": aid_b, "actions": actions_b},
+                    "state_diff": {
+                        "only_in_a": only_a,
+                        "only_in_b": only_b,
+                        "changed": [{"key": k, "a": va, "b": vb} for k, va, vb in changed],
+                    },
+                },
+                default=str,
+            )
+        )
+        return
+
+    console.print(
+        Text.assemble(
+            ("A: ", "muted"),
+            (f"{proj_a}/{aid_a}", "action"),
+            (f"  ({len(rows_a)} steps)", "muted"),
+        )
+    )
+    console.print(
+        Text.assemble(
+            ("B: ", "muted"),
+            (f"{proj_b}/{aid_b}", "action"),
+            (f"  ({len(rows_b)} steps)", "muted"),
+        )
+    )
+
+    _print_action_path_diff(actions_a, actions_b)
+    _print_state_diff(state_a, state_b, only_a, only_b, changed)
+
+
+def _tail(
+    log_path: Path, *, project: str, app_id: str, poll_interval: float, once: bool = False
+) -> None:
+    """Live-render the tracker log via rich.Live, or one static snapshot when ``once``."""
+
+    def render(*, live: bool) -> Table:
+        rows = _read_steps(log_path)
+        hint = f" · polling {poll_interval}s · Ctrl-C to stop" if live else ""
+        suffix = f"  [dim]· {len(rows)} step(s){hint}[/]"
+        return _build_steps_table(rows, project=project, app_id=app_id, title_suffix=suffix)
+
+    if once:
+        console.print(render(live=False))
+        return
+
+    try:
+        with Live(render(live=True), console=console, refresh_per_second=4, screen=False) as view:
+            while True:
+                time.sleep(poll_interval)
+                view.update(render(live=True))
+    except KeyboardInterrupt:
+        console.print("[dim](stopped)[/]")
+
+
+def sessions_tail(
+    app_id: Annotated[
+        str | None,
+        typer.Argument(help="App id (full uuid or prefix). Defaults to most recent."),
+    ] = None,
+    project: Annotated[
+        str | None,
+        typer.Option("--project", "-p", help="Project name. Defaults to most recent."),
+    ] = None,
+    home: Annotated[
+        Path | None,
+        typer.Option(
+            "--home", help="Tracker storage root. Overrides the CLI default (see --help)."
+        ),
+    ] = None,
+    poll_interval: Annotated[
+        float, typer.Option("--poll", help="Polling interval in seconds.")
+    ] = 0.5,
+    once: Annotated[
+        bool,
+        typer.Option(
+            "--once", help="Print one snapshot and exit (for pipes/CI) instead of live-tailing."
+        ),
+    ] = False,
+) -> None:
+    """Live-tail a running (or completed) session as a rich-rendered table."""
+    home = _resolve_home(home)
+    log_path, proj, aid = _resolve_app(home, project, app_id)
+    _tail(log_path, project=proj, app_id=aid, poll_interval=poll_interval, once=once)
+
+
+def watch(
+    app_id: Annotated[
+        str | None,
+        typer.Argument(help="App id (full uuid or prefix). Defaults to most recent."),
+    ] = None,
+    project: Annotated[
+        str | None,
+        typer.Option("--project", "-p", help="Project name. Defaults to most recent."),
+    ] = None,
+    home: Annotated[
+        Path | None,
+        typer.Option(
+            "--home", help="Tracker storage root. Overrides the CLI default (see --help)."
+        ),
+    ] = None,
+    list_projects: Annotated[
+        bool,
+        typer.Option(
+            "--list",
+            help="(Deprecated alias for `sessions ls`.) List projects and exit.",
+        ),
+    ] = False,
+    poll_interval: Annotated[
+        float, typer.Option("--poll", help="Polling interval in seconds.")
+    ] = 0.5,
+    once: Annotated[
+        bool,
+        typer.Option(
+            "--once", help="Print one snapshot and exit (for pipes/CI) instead of live-tailing."
+        ),
+    ] = False,
+) -> None:
+    """Alias for `sessions tail`. Lives at the top level for muscle memory."""
+    if list_projects:
+        sessions_ls(home=home, project=None, limit=8, as_json=False)
+        return
+    sessions_tail(app_id=app_id, project=project, home=home, poll_interval=poll_interval, once=once)
+
+
+def _print_log_row(r: Any, detail: str, *, plain: bool) -> None:
+    """Render one ``logs`` line, either pipe-friendly plain or rich-marked."""
+    ms = "" if r.duration_ms is None else f"{r.duration_ms:.0f}ms"
+    if plain:
+        mark = {"ok": "OK", "error": "ERR", "running": "...."}[r.status]
+        console.print(
+            f"{r.seq:>3}  {_short_ts(r.started)}  {mark:<4} {r.action:<22} {ms:>7}  {detail}",
+            highlight=False,
+            markup=False,
+        )
+        return
+    line = Text.assemble(
+        (f"{r.seq:>3} ", "muted"),
+        (f"{_short_ts(r.started)} ", "subtle"),
+        _status_text(r.status),
+        (f" {r.action:<22} ", "action"),
+        (f"{ms:>7}  ", "muted"),
+        (detail, "err" if r.status == "error" else "subtle"),
+    )
+    console.print(line)
+
+
+def logs(
+    app_id: Annotated[
+        str | None,
+        typer.Argument(help="App id (full uuid or prefix). Defaults to most recent."),
+    ] = None,
+    project: Annotated[
+        str | None,
+        typer.Option("--project", "-p", help="Project name. Defaults to most recent."),
+    ] = None,
+    home: Annotated[
+        Path | None,
+        typer.Option(
+            "--home", help="Tracker storage root. Overrides the CLI default (see --help)."
+        ),
+    ] = None,
+    refusals_only: Annotated[
+        bool,
+        typer.Option("--refusals", help="Show only the steps that errored (refusals)."),
+    ] = False,
+    plain: Annotated[
+        bool,
+        typer.Option("--plain", help="No color, no glyphs; pipe-friendly for grep."),
+    ] = False,
+) -> None:
+    """Compact one-line-per-step log of a session, greppable.
+
+    The terse sibling of `sessions show` (rich table) and `sessions tail`
+    (live). One line per step: seq, time, status, action, duration, and the
+    state change. Pipe it: `authiro logs --plain | grep error`.
+    """
+    home = _resolve_home(home)
+    log_path, _proj, _aid = _resolve_app(home, project, app_id)
+    steps = _read_steps(log_path)
+    refusals = _read_refusals(log_path)
+    if refusals_only:
+        rows = [r for r in steps if r.status == "error"] + refusals
+    else:
+        rows = steps + refusals
+    rows.sort(key=_ts_sort_key)
+    if not rows:
+        console.print("[muted](no steps)[/]" if not plain else "(no steps)")
+        return
+    prev: dict[str, Any] | None = None
+    last_epoch = 0
+    for r in rows:
+        if r.epoch > last_epoch:
+            last_epoch = r.epoch
+            prev = None
+            marker = "  -  --:--:--  ..   (reset_session)"
+            console.print(marker if plain else f"[muted]{marker}[/]", markup=not plain)
+        detail = (
+            r.error_summary or "error"
+            if r.status == "error"
+            else _state_diff_text(r.state_summary, prev)
+        )
+        if r.status != "error":
+            prev = r.state_summary
+        _print_log_row(r, detail, plain=plain)

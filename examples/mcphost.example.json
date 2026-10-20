@@ -1,0 +1,30 @@
+{
+  "_comment": "Copy to ~/.mcp.json (or pass --config <this-file>) after editing the absolute paths. coffee runs the example script directly; triage uses the authiro CLI with --app-dir to make examples/ importable.",
+  "mcpServers": {
+    "authiro-coffee": {
+      "type": "stdio",
+      "command": "uv",
+      "args": [
+        "--directory",
+        "/ABSOLUTE/PATH/TO/authiro",
+        "run",
+        "python",
+        "examples/coffee_order.py"
+      ]
+    },
+    "authiro-triage": {
+      "type": "stdio",
+      "command": "uv",
+      "args": [
+        "--directory",
+        "/ABSOLUTE/PATH/TO/authiro",
+        "run",
+        "authiro",
+        "serve",
+        "triage:build_application",
+        "--app-dir",
+        "examples"
+      ]
+    }
+  }
+}

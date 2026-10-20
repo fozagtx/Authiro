@@ -1,0 +1,197 @@
+[project]
+name = "authiro"
+version = "0.1.0"
+description = "A safety gate between AI agents and the MCP tools they use: scope rules, prerequisites, signed human approvals, and a tamper-evident ledger."
+readme = "README.md"
+requires-python = ">=3.11,<3.15"
+license = "Apache-2.0"
+authors = [
+    { name = "fozagtx", email = "ibrahimpima76@gmail.com" },
+]
+keywords = [
+    "mcp",
+    "burr",
+    "state-machine",
+    "fsm",
+    "agent",
+    "llm",
+    "fastmcp",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries",
+    "Typing :: Typed",
+]
+dependencies = [
+    "apache-burr[tracking]>=0.42,<0.43",
+    "cryptography>=42",
+    "fastmcp>=3.4,<4.0",
+    "pydantic>=2,<3",
+    "pyyaml>=6",
+    "typer>=0.12,<1.0",
+]
+# Burr is 0.x; minor versions can break by convention, so we pin to a
+# single Burr minor (0.42) and bump deliberately. FastMCP follows semver,
+# so the upper bound is the next major (4.0). CI tests against the latest
+# patches inside these ranges; minor bumps go through a release with the
+# integration retested and called out in CHANGELOG.
+
+[project.optional-dependencies]
+observability = [
+    "apache-burr[opentelemetry]>=0.42,<0.43",
+    "opentelemetry-api>=1.20",
+    "opentelemetry-sdk>=1.20",
+]
+ui = [
+    "apache-burr[start]>=0.42,<0.43",
+]
+mellea = [
+    "mellea>=0.1",
+]
+claude = [
+    "anthropic>=0.40",
+]
+all = [
+    "authiro[observability]",
+    "authiro[mellea]",
+    "authiro[ui]",
+    "authiro[claude]",
+]
+
+[project.scripts]
+authiro = "authiro.cli:main"
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/authiro"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9",
+    "pytest-asyncio>=1.3.0",
+    "pytest-cov>=5",
+    "hypothesis>=6.100",
+    "ruff>=0.15",
+    "mypy>=1.10",
+    "mutmut>=3.2",
+    "authiro[observability]",
+    "psutil>=5.9",
+    "bandit>=1.8",
+    "detect-secrets>=1.5",
+    "sf-hamilton>=1.0,<2.0",
+    "claude-agent-sdk>=0.2.82",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["src"]
+extend-exclude = ["examples/data"]
+
+[tool.ruff.lint]
+select = [
+    "E", "F", "W", "I", "B", "C4", "UP", "SIM", "RUF", "PERF", "PIE", "RET",
+    "FURB",
+    "D",    # docstring presence + google style (see [tool.ruff.lint.pydocstyle])
+    "ANN",  # annotation completeness; backs the mypy --strict baseline at lint speed
+    "ERA",  # no commented-out code
+]
+# ANN401: the adapter's Any at Burr/FastMCP boundaries is the documented
+# reality `ignore_missing_imports` exists for; banning Any would force
+# fictional annotations on third-party objects.
+ignore = ["ANN401"]
+# Brand glyphs: ⊢ (turnstile, allowed) and × (multiplication, refused) are
+# Authiro's wire-shape markers. Ruff's ambiguous-Unicode lint flags them as
+# look-alikes; that ambiguity is the point of using them as glyphs.
+allowed-confusables = ["×", "⊢"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+# Test prose and example walkthroughs are not API docs; annotation pressure
+# there hurts readability without adding safety (mypy doesn't check them).
+# ERA001 false-positives on prose section comments ("# FSM: gating") and
+# documentation sketches, which tests and examples use heavily; it stays
+# enforced for src/.
+"tests/**/*.py" = ["E402", "D", "ANN", "ERA"]
+"examples/**/*.py" = ["D", "ANN", "ERA"]
+"bench/**/*.py" = ["D", "ANN", "ERA"]
+"demos/**/*.py" = ["D", "ANN", "ERA"]
+"scripts/**/*.py" = ["D", "ANN"]
+# _experimental is excluded from the audit standards wholesale (see its
+# README); it keeps the baseline ruleset only.
+"src/authiro/_experimental/**" = ["D", "ANN"]
+"vulture_whitelist.py" = ["B018", "F821"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+# Burr and FastMCP ship incomplete stubs; keep this so strict mode checks
+# OUR annotations without inventing errors at third-party boundaries.
+ignore_missing_imports = true
+exclude = ["_experimental/"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "strict"
+markers = [
+    "smoke: integration tests that drive a real Claude session via the Agent SDK against the demo bench (deselected by default; run with `pytest -m smoke`)",
+]
+addopts = "-m 'not smoke'"
+
+[tool.coverage.run]
+source = ["authiro"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+exclude_also = ["if TYPE_CHECKING:", "raise NotImplementedError", "\\.\\.\\."]
+
+[tool.vulture]
+# The whitelist file holds justified false positives (e.g. FastAPI path
+# parameters that must exist but are unread). CI fails on any new finding.
+paths = ["src/authiro", "vulture_whitelist.py"]
+min_confidence = 80
+
+[tool.bandit]
+# MEDIUM and above gate CI (`bandit -r src/authiro --severity-level medium`).
+# Suppressions in code must carry `# nosec <check-id>` plus a rationale.
+targets = ["src/authiro"]
+
+# Mutation testing. Starter scope is the security-critical audit ledger; run
+# `uv run mutmut run` to check the suite actually kills mutations there (the
+# property tests in tests/test_property_ledger.py are the intended killers).
+# Not a CI gate (too slow per PR); expand paths_to_mutate as coverage hardens.
+[tool.mutmut]
+paths_to_mutate = ["src/authiro/ledger.py"]
+# Only the thread-free ledger tests: they are the intended mutation killers.
+# Anything that opens a FastMCP client (test_ledger.py's end-to-end cases,
+# the CLI runners) leaves live threads behind after mutmut's in-process
+# stats run, and forking a threaded process segfaults mutmut's workers on
+# macOS.
+tests_dir = [
+    "tests/test_ledger_chain.py",
+    "tests/test_property_ledger.py",
+]
+# mutmut copies only paths_to_mutate into mutants/, which leaves a broken
+# partial `authiro` namespace package that shadows the installed one; copy
+# the whole package so the mutated module imports alongside its siblings,
+# and examples/ because conftest.py puts it on sys.path for the test FSMs.
+also_copy = ["src/authiro/", "examples/"]
